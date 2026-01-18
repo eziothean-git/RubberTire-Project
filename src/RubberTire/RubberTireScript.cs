@@ -29,6 +29,12 @@ public class RubberTireWheelScript : BlockScript
     public float vBlend = 0.5f;            // 低速衰减：V/(V+vBlend)
 
     // =========================
+    // 踏面裁切（把球形触发域裁成“有限宽度圆柱体”）
+    // =========================
+    public bool enableTreadWidthClip = true;
+    public float treadWidth = 1.0f;        // 踏面总宽（世界单位；会乘以轴向缩放）
+
+    // =========================
     // 接触点获取
     // =========================
     public bool useRaycastContact = true;
@@ -63,6 +69,8 @@ public class RubberTireWheelScript : BlockScript
     // =========================
     private MSlider uiK, uiC, uiMu, uiCx, uiCy, uiLineW, uiForceScale;
     private MToggle uiDbg;
+    private MToggle uiTreadClip;
+    private MSlider uiTreadW;
 
     // =========================
     // 运行时状态
@@ -84,17 +92,21 @@ public class RubberTireWheelScript : BlockScript
     public override void SafeAwake()
     {
         // 用官方 Mapper UI 暴露参数（如果你已经在 XML 定义了同 key，可能会出现重复项；不想重复就删掉这段）
-        uiK = AddSlider("k", "K (Spring)", springK, 0f, 20000f);
-        uiC = AddSlider("c", "C (Damper)", damperC, 0f, 200f);
+        //uiK = AddSlider("k", "K (Spring)", springK, 0f, 20000f);
+        //uiC = AddSlider("c", "C (Damper)", damperC, 0f, 200f);
 
-        uiMu = AddSlider("mu", "Mu", mu, 0f, 3f);
-        uiCx = AddSlider("cx", "Cx", Cx, 0f, 80000f);
-        uiCy = AddSlider("cy", "Cy", Cy, 0f, 80000f);
+        //uiMu = AddSlider("mu", "Mu", mu, 0f, 3f);
+        //uiCx = AddSlider("cx", "Cx", Cx, 0f, 80000f);
+        //uiCy = AddSlider("cy", "Cy", Cy, 0f, 80000f);
 
-        uiDbg = AddToggle("dbg", "Debug Draw", debugDraw);
+        //uiDbg = AddToggle("dbg", "Debug Draw", debugDraw);
 
-        uiLineW = AddSlider("lw", "Line Width", forceLineWidth, 0.01f, 0.30f);
-        uiForceScale = AddSlider("fs", "Force Scale", forceToLength, 0.00001f, 0.01f);
+        // 踏面裁切：把触发球/胶囊裁成“有限宽度”踏面
+        //uiTreadClip = AddToggle("tw-clip", "Tread Width Clip", enableTreadWidthClip);
+        //uiTreadW = AddSlider("tw", "Tread Width", treadWidth, 0.05f, 5f);
+
+        //uiLineW = AddSlider("lw", "Line Width", forceLineWidth, 0.01f, 0.30f);
+        //uiForceScale = AddSlider("fs", "Force Scale", forceToLength, 0.00001f, 0.01f);
     }
 
     public override void OnSimulateStart()
@@ -159,6 +171,16 @@ public class RubberTireWheelScript : BlockScript
 
         Vector3 downDir = useWorldDown ? Vector3.down : -transform.up;
 
+        // 踏面裁切参数（世界）
+        Vector3 axisWorld = GetWheelAxisWorld();
+        float halfW = 0f;
+        bool doClip = enableTreadWidthClip && treadWidth > 0f;
+        if (doClip)
+        {
+            axisWorld.Normalize();
+            halfW = 0.5f * treadWidth * GetAxisScaleWorld();
+        }
+
         // ===== 单接触点：选 penetration 最大的那个 =====
         bool hasBest = false;
         Vector3 pBest = Vector3.zero;
@@ -172,6 +194,10 @@ public class RubberTireWheelScript : BlockScript
 
             Vector3 p, n;
             if (!TryGetContact(col, center, downDir, R, out p, out n)) continue;
+
+            // 裁切：只有接触点落在踏面宽度范围内才参与计算
+            if (doClip && !IsWithinTreadWidth(p, center, axisWorld, halfW))
+                continue;
 
             float pen = R - Vector3.Distance(center, p);
             if (pen <= 0f) continue;
@@ -354,6 +380,12 @@ public class RubberTireWheelScript : BlockScript
 
         if (uiDbg != null) debugDraw = uiDbg.IsActive;
 
+        if (uiTreadClip != null) enableTreadWidthClip = uiTreadClip.IsActive;
+        if (uiTreadW != null) treadWidth = uiTreadW.Value;
+
+        if (uiTreadClip != null) enableTreadWidthClip = uiTreadClip.IsActive;
+        if (uiTreadW != null) treadWidth = uiTreadW.Value;
+
         if (uiLineW != null)
         {
             // 你拖动一个滑条同时控制“细线/力线”
@@ -432,6 +464,28 @@ public class RubberTireWheelScript : BlockScript
         return transform.right;
     }
 
+    // 轮轴方向上的缩放（用于把 treadWidth 从“未缩放值”映射到世界单位）
+    // 说明：半径 R 你用的是 MaxAbsComponent(lossyScale)，这里我们只取轴向分量更合理。
+    private float GetAxisScaleWorld()
+    {
+        Vector3 s = transform.lossyScale;
+        switch (wheelAxisLocal)
+        {
+            case AxisLocal.X: return Mathf.Abs(s.x);
+            case AxisLocal.Y: return Mathf.Abs(s.y);
+            case AxisLocal.Z: return Mathf.Abs(s.z);
+        }
+        return 1f;
+    }
+
+    // 踏面宽度裁切：把球形触发域裁成“有限宽度圆柱体”（只做宽度裁切，不做半径裁切）
+    private bool IsWithinTreadWidth(Vector3 pointWorld, Vector3 centerWorld, Vector3 axisWorldUnit, float halfWWorld)
+    {
+        // axisWorldUnit 需要是单位向量
+        float s = Vector3.Dot(pointWorld - centerWorld, axisWorldUnit);
+        return Mathf.Abs(s) <= halfWWorld;
+    }
+
     private Vector3 ProjectOnPlane(Vector3 v, Vector3 n)
     {
         return v - Vector3.Dot(v, n) * n;
@@ -505,19 +559,23 @@ public class RubberTireWheelScript : BlockScript
     }
 
     private Material CreateColorMaterial(Color color)
-    {
-        Shader sh = Shader.Find("Particles/Additive");
-        if (sh == null) sh = Shader.Find("Particles/Alpha Blended");
-        if (sh == null) sh = Shader.Find("Diffuse");
+{
+    Shader sh = Shader.Find("Particles/Additive");
+    if (sh == null) sh = Shader.Find("Particles/Alpha Blended");
+    if (sh == null) sh = Shader.Find("Unlit/Color");
+    if (sh == null) sh = Shader.Find("Diffuse");
 
-        var mat = new Material(sh);
+    var mat = new Material(sh);
+    mat.mainTexture = Texture2D.whiteTexture;
 
-        // 强制白纹理，很多旧 shader 会用纹理乘色，否则会发灰/看不出色
-        mat.mainTexture = Texture2D.whiteTexture;
-        mat.color = color;
+    // ✅ 关键：Particles 系列多用 _TintColor
+    if (mat.HasProperty("_TintColor")) mat.SetColor("_TintColor", color);
+    if (mat.HasProperty("_Color"))     mat.SetColor("_Color", color);
 
-        return mat;
-    }
+    mat.color = color; // 兜底
+    return mat;
+}
+
 
     private LineRenderer CreateLine(string name, Color color, float width)
     {
@@ -526,15 +584,22 @@ public class RubberTireWheelScript : BlockScript
 
         var lr = go.AddComponent<LineRenderer>();
         lr.useWorldSpace = true;
+
+        // 老 Unity 的 LineRenderer API
         lr.SetVertexCount(2);
         lr.SetWidth(width, width);
 
+        // ✅ 关键：老版本用 SetColors
+        lr.SetColors(color, color);
+
+        // 材质仍然给（用于透明/发光等），但不再依赖 mat.color 作为唯一上色手段
         lr.material = CreateColorMaterial(color);
 
         lr.SetPosition(0, Vector3.zero);
         lr.SetPosition(1, Vector3.zero);
         return lr;
     }
+
 
     private void SetLine(LineRenderer lr, Vector3 a, Vector3 b)
     {

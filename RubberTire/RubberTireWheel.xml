@@ -86,6 +86,10 @@
 		<Slider displayName="Line Width" key="lw" min="0.01" max="0.3" default="0.08" unclamped="true" />
 		<Slider displayName="Force Scale" key="fs" min="0.00001" max="0.01" default="0.0008" unclamped="true" />
 
+		<!-- Tread width clipping: cut the spherical contact volume into a finite-width "disc" -->
+		<Toggle displayName="Tread Width Clip" key="tw-clip" default="true" />
+		<Slider displayName="Tread Width" key="tw" min="0.05" max="5" default="1.0" unclamped="true" />
+
 	</ModuleMapperTypes>
 
 
