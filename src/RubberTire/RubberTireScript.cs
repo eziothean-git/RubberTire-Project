@@ -4,11 +4,10 @@ using Modding;
 
 /// <summary>
 /// RubberTireWheelScript
-/// 0.1 目标：
 /// - 单接触点（pen 最大）
 /// - 法向弹簧阻尼 + 轮胎摩擦（kappa/alpha -> Fx/Fy -> 摩擦圆）
 /// - Debug 可视化（点/线）
-/// - 游戏内 UI 调参（K/C/mu/Cx/Cy/线宽/力缩放/Debug 开关）
+/// - 游戏内 UI 调参（K/C/mu/Cx/Cy/线宽/力缩放/Debug 开关/踏面裁切/仅踏面可视化）
 /// </summary>
 public class RubberTireWheelScript : BlockScript
 {
@@ -19,9 +18,9 @@ public class RubberTireWheelScript : BlockScript
     public float damperC = 25f;            // 法向阻尼
     public float maxNormalForce = 200000f; // 法向力上限
 
-    public bool enableTireModel = true;    // 是否启用轮胎摩擦模型（真实模型）
+    public bool enableTireModel = true;    // 是否启用轮胎摩擦模型
 
-    public float mu = 1.25f;                // 峰值摩擦系数
+    public float mu = 1.25f;               // 峰值摩擦系数
     public float Cx = 20000f;              // 纵向滑移刚度（N）
     public float Cy = 25000f;              // 侧偏刚度（N/rad）
 
@@ -41,7 +40,7 @@ public class RubberTireWheelScript : BlockScript
     public float rayExtra = 0.6f;
     public bool useWorldDown = true;
 
-    // 轮轴方向（局部），你可以按模型实际改
+    // 轮轴方向（局部）
     public enum AxisLocal { X, Y, Z }
     public AxisLocal wheelAxisLocal = AxisLocal.X;
 
@@ -53,32 +52,28 @@ public class RubberTireWheelScript : BlockScript
     // =========================
     public bool debugDraw = true;
 
-    public float thinLineWidth = 0.05f;    // 细线宽（轮心->接触点、法向）
-    public float forceLineWidth = 0.10f;   // 力线宽（法向力、切向力）
+    public float thinLineWidth = 0.05f;    // 细线宽
+    public float forceLineWidth = 0.10f;   // 力线宽
 
     public float normalArrowLen = 0.6f;
 
-    public float forceToLength = 0.015f;  // 力->长度映射
+    public float forceToLength = 0.015f;   // 力->长度映射
     public float arrowMinLen = 0.25f;
     public float arrowMaxLen = 4.0f;
 
-    public int drawEveryFixedSteps = 1;    // 每几帧画一次，调性能用
+    public int drawEveryFixedSteps = 1;    // 每几帧画一次
 
-    // =========================
     // Debug：踏面裁切范围可视化
-    // =========================
-    public bool debugDrawTreadRange = true;  // 显示踏面宽度范围（两侧圆环 + 轮轴线）
-    public bool treadVizOnly = false;        // 仅显示踏面范围与轴线（隐藏力/法向等其他 debug 线，便于观察）
-    public int treadRangeSegments = 28;      // 圆环分段数
-    public float treadAxisDebugLen = 2.0f;   // 轮轴线长度（乘以 R 再显示）
+    public bool debugDrawTreadRange = true;
+    public bool treadVizOnly = false;      // 仅显示踏面范围与轴线
+    public int treadRangeSegments = 28;
+    public float treadAxisDebugLen = 2.0f;
 
     // =========================
     // UI（Mapper）句柄
     // =========================
-    private MSlider uiK, uiC, uiMu, uiCx, uiCy, uiLineW, uiForceScale;
-    private MToggle uiDbg;
-    private MToggle uiTreadClip;
-    private MSlider uiTreadW;
+    private MSlider uiK, uiC, uiMu, uiCx, uiCy, uiLineW, uiForceScale, uiTreadW;
+    private MToggle uiDbg, uiTreadClip, uiTreadVizOnly, uiEnableTire;
 
     // =========================
     // 运行时状态
@@ -93,33 +88,38 @@ public class RubberTireWheelScript : BlockScript
     private LineRenderer lrNormal;
     private LineRenderer lrForceN;
     private LineRenderer lrForceT;
-    // Debug：踏面范围（轴线 + 两侧圆环）——使用 LineRenderer（游戏内可见，老 Unity API 兼容）
+
+    // Debug：踏面范围（轴线 + 两侧圆环）
     private LineRenderer lrTreadAxis;
     private LineRenderer lrTreadRingA;
     private LineRenderer lrTreadRingB;
+
     private GameObject dbgPointSphere;
 
     // ----------- 生命周期 -----------
 
     public override void SafeAwake()
     {
-        // 用官方 Mapper UI 暴露参数（如果你已经在 XML 定义了同 key，可能会出现重复项；不想重复就删掉这段）
-        //uiK = AddSlider("
-        // k", "K (Spring)", springK, 0f, 20000f);
-        //uiC = AddSlider("c", "C (Damper)", damperC, 0f, 200f);
+        // ✅ 关键修复：把 UI 句柄真正创建出来（否则 uiK/uiMu... 全是 null，UI 改了也不影响脚本）
+        // 如果你选择用 XML <MapperTypes> 来定义脚本 UI，请把这一段注释掉，避免重复。
+        uiK = AddSlider("K (Spring)", "k", springK, 0f, 20000f);
+        uiC = AddSlider("C (Damper)", "c", damperC, 0f, 200f);
 
-        //uiMu = AddSlider("mu", "Mu", mu, 0f, 3f);
-        //uiCx = AddSlider("cx", "Cx", Cx, 0f, 80000f);
-        //uiCy = AddSlider("cy", "Cy", Cy, 0f, 80000f);
+        uiMu = AddSlider("Mu", "mu", mu, 0f, 3f);
+        uiCx = AddSlider("Cx", "cx", Cx, 0f, 80000f);
+        uiCy = AddSlider("Cy", "cy", Cy, 0f, 80000f);
 
-        //uiDbg = AddToggle("dbg", "Debug Draw", debugDraw);
+        uiEnableTire = AddToggle("Tire Model", "tire", enableTireModel);
 
-        // 踏面裁切：把触发球/胶囊裁成“有限宽度”踏面
-        //uiTreadClip = AddToggle("tw-clip", "Tread Width Clip", enableTreadWidthClip);
-        //uiTreadW = AddSlider("tw", "Tread Width", treadWidth, 0.05f, 5f);
+        uiDbg = AddToggle("Debug Draw", "dbg", debugDraw);
 
-        //uiLineW = AddSlider("lw", "Line Width", forceLineWidth, 0.01f, 0.30f);
-        //uiForceScale = AddSlider("fs", "Force Scale", forceToLength, 0.00001f, 0.01f);
+        uiTreadClip = AddToggle("Tread Width Clip", "tw-clip", enableTreadWidthClip);
+        uiTreadW = AddSlider("Tread Width", "tw", treadWidth, 0.05f, 5f);
+
+        uiTreadVizOnly = AddToggle("Tread Viz Only", "treadVizOnly", treadVizOnly);
+
+        uiLineW = AddSlider("Line Width", "lw", forceLineWidth, 0.01f, 0.30f);
+        uiForceScale = AddSlider("Force Scale", "fs", forceToLength, 0.00001f, 0.01f);
     }
 
     public override void OnSimulateStart()
@@ -127,10 +127,9 @@ public class RubberTireWheelScript : BlockScript
         contacts.Clear();
         fixedStepCounter = 0;
 
-        // 找到本 block 的踏面 trigger capsule，用它来定义轮心/半径（解决 XML offset）
+        // 找到本 block 的踏面 trigger capsule，用它来定义轮心/半径
         treadTriggerCapsule = FindTreadTriggerCapsule();
 
-        // 如果需要画 debug，先创建对象
         if (ShowDebugVisuals && debugDraw)
             EnsureDebugObjects();
     }
@@ -184,42 +183,38 @@ public class RubberTireWheelScript : BlockScript
 
         Vector3 downDir = useWorldDown ? Vector3.down : -transform.up;
 
-        // 踏面裁切参数（世界）
+        // ===== 踏面裁切参数（世界）=====
         Vector3 axisWorld = Vector3.right;
-    float halfW = 0f;
-    bool doClip = enableTreadWidthClip && treadWidth > 0f;
+        float halfW = 0f;
+        bool doClip = enableTreadWidthClip && treadWidth > 0f;
 
-    if (doClip)
-    {
-        // 1) 轴方向：优先用触发胶囊自己的 direction（最可靠）
-        if (treadTriggerCapsule != null)
+        if (doClip)
         {
-            Transform t = treadTriggerCapsule.transform;
-            switch (treadTriggerCapsule.direction) // 0=X 1=Y 2=Z
+            if (treadTriggerCapsule != null)
             {
-                case 0: axisWorld = t.right;   break;
-                case 1: axisWorld = t.up;      break;
-                case 2: axisWorld = t.forward; break;
+                Transform t = treadTriggerCapsule.transform;
+                switch (treadTriggerCapsule.direction) // 0=X 1=Y 2=Z
+                {
+                    case 0: axisWorld = t.right; break;
+                    case 1: axisWorld = t.up; break;
+                    case 2: axisWorld = t.forward; break;
+                }
+
+                Vector3 s = t.lossyScale;
+                float axisScale =
+                    (treadTriggerCapsule.direction == 0) ? Mathf.Abs(s.x) :
+                    (treadTriggerCapsule.direction == 1) ? Mathf.Abs(s.y) :
+                                                           Mathf.Abs(s.z);
+
+                axisWorld.Normalize();
+                halfW = 0.5f * treadWidth * axisScale;
             }
-
-            // 2) 宽度缩放：也用胶囊自己的缩放（避免父子层级不一致）
-            Vector3 s = t.lossyScale;
-            float axisScale =
-                (treadTriggerCapsule.direction == 0) ? Mathf.Abs(s.x) :
-                (treadTriggerCapsule.direction == 1) ? Mathf.Abs(s.y) :
-                                                    Mathf.Abs(s.z);
-
-            axisWorld.Normalize();
-            halfW = 0.5f * treadWidth * axisScale;
+            else
+            {
+                axisWorld = GetWheelAxisWorld().normalized;
+                halfW = 0.5f * treadWidth * GetAxisScaleWorld();
+            }
         }
-        else
-        {
-            // fallback：没有胶囊时才用脚本 transform
-            axisWorld = GetWheelAxisWorld().normalized;
-            halfW = 0.5f * treadWidth * GetAxisScaleWorld();
-        }
-    }
-
 
         // ===== 单接触点：选 penetration 最大的那个 =====
         bool hasBest = false;
@@ -235,7 +230,6 @@ public class RubberTireWheelScript : BlockScript
             Vector3 p, n;
             if (!TryGetContact(col, center, downDir, R, out p, out n)) continue;
 
-            // 裁切：只有接触点落在踏面宽度范围内才参与计算
             if (doClip && !IsWithinTreadWidth(p, center, axisWorld, halfW))
                 continue;
 
@@ -280,7 +274,7 @@ public class RubberTireWheelScript : BlockScript
             Rigidbody.AddTorque(aAxis * driveTorque, ForceMode.Force);
         }
 
-        // ===== 2) 轮胎摩擦模型（kappa/alpha -> Fx/Fy -> 摩擦圆）=====
+        // ===== 2) 轮胎摩擦模型 =====
         Vector3 Ftire = Vector3.zero;
 
         if (enableTireModel && Fn > 0f)
@@ -293,48 +287,34 @@ public class RubberTireWheelScript : BlockScript
             Vector3 vWheel = Rigidbody.GetPointVelocity(pBest);
             Vector3 vRel = vWheel - vGround;
 
-            // 轮轴（世界）
             Vector3 a = GetWheelAxisWorld().normalized;
 
-            // 滚动方向 f：优先用“瞬时滚动方向”增加鲁棒性
             Vector3 omegaVec = Rigidbody.angularVelocity;
             Vector3 f0 = Vector3.Cross(omegaVec, -nBest);
             Vector3 f = ProjectOnPlane(f0, nBest);
 
             if (f.sqrMagnitude < 1e-6f)
-            {
-                // 回退：f = n × a
                 f = ProjectOnPlane(Vector3.Cross(nBest, a), nBest);
-            }
+
             if (f.sqrMagnitude < 1e-6f)
             {
-                // 再回退：不计算
-                f = Vector3.zero;
-            }
-            else f.Normalize();
-
-            // 侧向方向 s：尽量与 f、n 正交
-            Vector3 sdir = Vector3.Cross(nBest, f);
-            if (sdir.sqrMagnitude > 1e-6f) sdir.Normalize();
-
-            if (f == Vector3.zero || sdir == Vector3.zero)
-            {
-                // 几何退化时，不算轮胎力
                 Ftire = Vector3.zero;
             }
             else
             {
-                // 切平面相对速度
+                f.Normalize();
+
+                Vector3 sdir = Vector3.Cross(nBest, f);
+                if (sdir.sqrMagnitude > 1e-6f) sdir.Normalize();
+
                 Vector3 vT = ProjectOnPlane(vRel, nBest);
 
                 float Vx = Vector3.Dot(vT, f);
                 float Vy = Vector3.Dot(vT, sdir);
 
-                // 轮周速度 Vw = omega_axis * R
                 float omega = Vector3.Dot(omegaVec, a);
                 float Vw = omega * R;
 
-                // 速度尺度：用切向速度大小，避免 Vx≈0 导致 κ 坍塌
                 float V = Mathf.Max(vT.magnitude, vEps);
 
                 float kappa = (Vw - Vx) / V;
@@ -343,7 +323,6 @@ public class RubberTireWheelScript : BlockScript
                 float Fx0 = Cx * kappa;
                 float Fy0 = -Cy * alpha;
 
-                // 摩擦圆
                 float Fmax = mu * Fn;
                 float Fmag0 = Mathf.Sqrt(Fx0 * Fx0 + Fy0 * Fy0);
 
@@ -355,27 +334,23 @@ public class RubberTireWheelScript : BlockScript
                     Fy *= scale;
                 }
 
-                // 低速衰减
                 float w = V / (V + Mathf.Max(1e-4f, vBlend));
                 Fx *= w;
                 Fy *= w;
 
                 Ftire = Fx * f + Fy * sdir;
 
-                // 施加到轮子 + 反作用到地面刚体（如果有）
                 Rigidbody.AddForceAtPosition(Ftire, pBest, ForceMode.Force);
                 if (groundRb != null) groundRb.AddForceAtPosition(-Ftire, pBest, ForceMode.Force);
             }
         }
 
-        // ===== Debug 可视化（先保证可见，颜色后续再精修）=====
-        if (ShowDebugVisuals && debugDraw &&
-            (fixedStepCounter % Mathf.Max(1, drawEveryFixedSteps) == 0))
+        // ===== Debug 可视化 =====
+        if (ShowDebugVisuals && debugDraw && (fixedStepCounter % Mathf.Max(1, drawEveryFixedSteps) == 0))
         {
             EnsureDebugObjects();
             ShowDebugObjects();
 
-            // 如果启用“仅踏面可视化”，先把其他线条/点隐藏掉，避免和力矢量重叠看不清
             if (treadVizOnly)
             {
                 SetLRVisible(lrCenterToP, false);
@@ -393,7 +368,6 @@ public class RubberTireWheelScript : BlockScript
                 if (dbgPointSphere != null) dbgPointSphere.SetActive(true);
             }
 
-            // 非“仅踏面可视化”时才画力/法向等
             if (!treadVizOnly)
             {
                 SetLine(lrCenterToP, center, pBest);
@@ -417,7 +391,6 @@ public class RubberTireWheelScript : BlockScript
                 if (dbgPointSphere != null) dbgPointSphere.transform.position = pBest;
             }
 
-            // 踏面宽度范围：两侧圆环 + 轮轴线（用于检查裁切方向/宽度是否正确）
             if (doClip && debugDrawTreadRange)
             {
                 SetLRVisible(lrTreadAxis, true);
@@ -432,7 +405,6 @@ public class RubberTireWheelScript : BlockScript
                 SetLRVisible(lrTreadRingB, false);
             }
 
-            // 线宽可能被 UI 改了，需要实时同步
             ApplyLineWidthsIfReady();
         }
         else
@@ -446,8 +418,6 @@ public class RubberTireWheelScript : BlockScript
     // =========================
     private void SyncParamsFromUI()
     {
-        // 注意：MSlider/MToggle 在不同版本 API 命名可能不同；
-        // 你目前能编译说明 .Value / .IsActive 是可用的。
         if (uiK != null) springK = uiK.Value;
         if (uiC != null) damperC = uiC.Value;
 
@@ -455,21 +425,22 @@ public class RubberTireWheelScript : BlockScript
         if (uiCx != null) Cx = uiCx.Value;
         if (uiCy != null) Cy = uiCy.Value;
 
+        if (uiEnableTire != null) enableTireModel = uiEnableTire.IsActive;
+
         if (uiDbg != null) debugDraw = uiDbg.IsActive;
 
         if (uiTreadClip != null) enableTreadWidthClip = uiTreadClip.IsActive;
         if (uiTreadW != null) treadWidth = uiTreadW.Value;
 
-        if (uiTreadClip != null) enableTreadWidthClip = uiTreadClip.IsActive;
-        if (uiTreadW != null) treadWidth = uiTreadW.Value;
+        if (uiTreadVizOnly != null) treadVizOnly = uiTreadVizOnly.IsActive;
 
         if (uiLineW != null)
         {
-            // 你拖动一个滑条同时控制“细线/力线”
             float w = uiLineW.Value;
             forceLineWidth = w;
             thinLineWidth = w * 0.6f;
         }
+
         if (uiForceScale != null) forceToLength = uiForceScale.Value;
     }
 
@@ -519,7 +490,6 @@ public class RubberTireWheelScript : BlockScript
         }
         else
         {
-            // fallback：AABB 最近点（不推荐）
             Bounds b = col.bounds;
             p = ClosestPointOnAABB(b, center);
             Vector3 nn = center - p;
@@ -544,8 +514,6 @@ public class RubberTireWheelScript : BlockScript
         return transform.right;
     }
 
-    // 轮轴方向上的缩放（用于把 treadWidth 从“未缩放值”映射到世界单位）
-    // 说明：半径 R 你用的是 MaxAbsComponent(lossyScale)，这里我们只取轴向分量更合理。
     private float GetAxisScaleWorld()
     {
         Vector3 s = transform.lossyScale;
@@ -558,10 +526,8 @@ public class RubberTireWheelScript : BlockScript
         return 1f;
     }
 
-    // 踏面宽度裁切：把球形触发域裁成“有限宽度圆柱体”（只做宽度裁切，不做半径裁切）
     private bool IsWithinTreadWidth(Vector3 pointWorld, Vector3 centerWorld, Vector3 axisWorldUnit, float halfWWorld)
     {
-        // axisWorldUnit 需要是单位向量
         float s = Vector3.Dot(pointWorld - centerWorld, axisWorldUnit);
         return Mathf.Abs(s) <= halfWWorld;
     }
@@ -580,20 +546,16 @@ public class RubberTireWheelScript : BlockScript
         if (axisWorldUnit.sqrMagnitude < 1e-8f) return;
         axisWorldUnit.Normalize();
 
-        // 使用 LineRenderer 画（游戏内可见）；若 debug 对象未初始化则直接返回
         if (lrTreadAxis == null || lrTreadRingA == null || lrTreadRingB == null) return;
 
-        // 轴线（黄色）
         float axisLen = Mathf.Max(radius * 0.5f, radius * treadAxisDebugLen);
         SetLine(lrTreadAxis, center - axisWorldUnit * axisLen, center + axisWorldUnit * axisLen);
 
-        // 计算圆环所在平面的基底 u/v（都与 axis 正交）
         Vector3 u = Vector3.Cross(axisWorldUnit, Vector3.up);
         if (u.sqrMagnitude < 1e-6f) u = Vector3.Cross(axisWorldUnit, Vector3.right);
         u.Normalize();
         Vector3 v = Vector3.Cross(axisWorldUnit, u).normalized;
 
-        // 两侧边界圆环（青色）：center ± axis * halfW（闭合 polyline：seg+1 点）
         int seg = Mathf.Clamp(treadRangeSegments, 8, 128);
         int count = seg + 1;
         lrTreadRingA.SetVertexCount(count);
@@ -613,19 +575,6 @@ public class RubberTireWheelScript : BlockScript
             float a = (Mathf.PI * 2f) * ((float)i / (float)segments);
             Vector3 p = center + (Mathf.Cos(a) * u + Mathf.Sin(a) * v) * r;
             lr.SetPosition(i, p);
-        }
-    }
-
-    private void DrawCircleDebug(Vector3 center, Vector3 u, Vector3 v, float r, int segments, Color color)
-    {
-        float step = (Mathf.PI * 2f) / segments;
-        Vector3 prev = center + u * r;
-        for (int i = 1; i <= segments; i++)
-        {
-            float a = step * i;
-            Vector3 p = center + (Mathf.Cos(a) * u + Mathf.Sin(a) * v) * r;
-            Debug.DrawLine(prev, p, color);
-            prev = p;
         }
     }
 
@@ -673,13 +622,11 @@ public class RubberTireWheelScript : BlockScript
         if (MainVis != null) dbgRoot.transform.SetParent(MainVis, false);
         else dbgRoot.transform.SetParent(transform, false);
 
-        // 尽力区分颜色（若你的环境仍吞色，至少线宽能看清）
         lrCenterToP = CreateLine("L_center_p", Color.white, thinLineWidth);
-        lrNormal    = CreateLine("L_normal",   Color.green, thinLineWidth);
-        lrForceN    = CreateLine("L_forceN",   Color.red,   forceLineWidth);
-        lrForceT    = CreateLine("L_forceT",   Color.blue,  forceLineWidth);
+        lrNormal = CreateLine("L_normal", Color.green, thinLineWidth);
+        lrForceN = CreateLine("L_forceN", Color.red, forceLineWidth);
+        lrForceT = CreateLine("L_forceT", Color.blue, forceLineWidth);
 
-        // 踏面范围：轮轴线（2 点）+ 两侧圆环（polyline，seg+1 点闭合）
         lrTreadAxis = CreateLine("L_tread_axis", Color.yellow, thinLineWidth);
         int seg = Mathf.Clamp(treadRangeSegments, 8, 128);
         lrTreadRingA = CreatePolyline("L_tread_ringA", Color.cyan, thinLineWidth, seg + 1);
@@ -694,32 +641,27 @@ public class RubberTireWheelScript : BlockScript
         if (c != null) c.enabled = false;
 
         var r = dbgPointSphere.GetComponent<Renderer>();
-        if (r != null)
-        {
-            r.material = CreateColorMaterial(Color.yellow);
-        }
+        if (r != null) r.material = CreateColorMaterial(Color.yellow);
 
         HideDebugObjects();
     }
 
     private Material CreateColorMaterial(Color color)
-{
-    Shader sh = Shader.Find("Particles/Additive");
-    if (sh == null) sh = Shader.Find("Particles/Alpha Blended");
-    if (sh == null) sh = Shader.Find("Unlit/Color");
-    if (sh == null) sh = Shader.Find("Diffuse");
+    {
+        Shader sh = Shader.Find("Particles/Additive");
+        if (sh == null) sh = Shader.Find("Particles/Alpha Blended");
+        if (sh == null) sh = Shader.Find("Unlit/Color");
+        if (sh == null) sh = Shader.Find("Diffuse");
 
-    var mat = new Material(sh);
-    mat.mainTexture = Texture2D.whiteTexture;
+        var mat = new Material(sh);
+        mat.mainTexture = Texture2D.whiteTexture;
 
-    // ✅ 关键：Particles 系列多用 _TintColor
-    if (mat.HasProperty("_TintColor")) mat.SetColor("_TintColor", color);
-    if (mat.HasProperty("_Color"))     mat.SetColor("_Color", color);
+        if (mat.HasProperty("_TintColor")) mat.SetColor("_TintColor", color);
+        if (mat.HasProperty("_Color")) mat.SetColor("_Color", color);
 
-    mat.color = color; // 兜底
-    return mat;
-}
-
+        mat.color = color;
+        return mat;
+    }
 
     private LineRenderer CreateLine(string name, Color color, float width)
     {
@@ -729,14 +671,9 @@ public class RubberTireWheelScript : BlockScript
         var lr = go.AddComponent<LineRenderer>();
         lr.useWorldSpace = true;
 
-        // 老 Unity 的 LineRenderer API
         lr.SetVertexCount(2);
         lr.SetWidth(width, width);
-
-        // ✅ 关键：老版本用 SetColors
         lr.SetColors(color, color);
-
-        // 材质仍然给（用于透明/发光等），但不再依赖 mat.color 作为唯一上色手段
         lr.material = CreateColorMaterial(color);
 
         lr.SetPosition(0, Vector3.zero);
@@ -744,7 +681,6 @@ public class RubberTireWheelScript : BlockScript
         return lr;
     }
 
-    // 老 Unity：用 LineRenderer 画多段折线（polyline），用于踏面圆环
     private LineRenderer CreatePolyline(string name, Color color, float width, int vertexCount)
     {
         var go = new GameObject(name);
@@ -759,11 +695,9 @@ public class RubberTireWheelScript : BlockScript
         lr.SetColors(color, color);
         lr.material = CreateColorMaterial(color);
 
-        // 初始化顶点，避免未写入时某些版本出现随机线段
         for (int i = 0; i < vc; i++) lr.SetPosition(i, Vector3.zero);
         return lr;
     }
-
 
     private void SetLine(LineRenderer lr, Vector3 a, Vector3 b)
     {
@@ -772,29 +706,10 @@ public class RubberTireWheelScript : BlockScript
         lr.SetPosition(1, b);
     }
 
-    // 老 Unity：用 enabled 开关控制 LineRenderer 是否显示
     private void SetLRVisible(LineRenderer lr, bool visible)
     {
         if (lr == null) return;
         lr.enabled = visible;
-    }
-
-    private void MakeOrthoBasis(Vector3 axisUnit, out Vector3 u, out Vector3 v)
-    {
-        // 找一个不与 axis 平行的参考向量
-        Vector3 refVec = (Mathf.Abs(axisUnit.y) < 0.9f) ? Vector3.up : Vector3.right;
-        u = Vector3.Cross(axisUnit, refVec);
-        float um = u.magnitude;
-        if (um < 1e-6f)
-        {
-            refVec = Vector3.forward;
-            u = Vector3.Cross(axisUnit, refVec);
-            um = u.magnitude;
-        }
-        u /= Mathf.Max(1e-6f, um);
-        v = Vector3.Cross(axisUnit, u);
-        float vm = v.magnitude;
-        v /= Mathf.Max(1e-6f, vm);
     }
 
     private void ShowDebugObjects()
