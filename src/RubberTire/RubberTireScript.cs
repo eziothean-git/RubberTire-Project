@@ -65,6 +65,13 @@ public class RubberTireWheelScript : BlockScript
     public int drawEveryFixedSteps = 1;    // 每几帧画一次，调性能用
 
     // =========================
+    // Debug：踏面裁切范围可视化
+    // =========================
+    public bool debugDrawTreadRange = true;  // 显示踏面宽度范围（两侧圆环 + 轮轴线）
+    public int treadRangeSegments = 28;      // 圆环分段数
+    public float treadAxisDebugLen = 2.0f;   // 轮轴线长度（乘以 R 再显示）
+
+    // =========================
     // UI（Mapper）句柄
     // =========================
     private MSlider uiK, uiC, uiMu, uiCx, uiCy, uiLineW, uiForceScale;
@@ -174,39 +181,39 @@ public class RubberTireWheelScript : BlockScript
 
         // 踏面裁切参数（世界）
         Vector3 axisWorld = Vector3.right;
-        float halfW = 0f;
-        bool doClip = enableTreadWidthClip && treadWidth > 0f;
+    float halfW = 0f;
+    bool doClip = enableTreadWidthClip && treadWidth > 0f;
 
-        if (doClip)
+    if (doClip)
+    {
+        // 1) 轴方向：优先用触发胶囊自己的 direction（最可靠）
+        if (treadTriggerCapsule != null)
         {
-            // 1) 轴方向：优先用触发胶囊自己的 direction（最可靠）
-            if (treadTriggerCapsule != null)
+            Transform t = treadTriggerCapsule.transform;
+            switch (treadTriggerCapsule.direction) // 0=X 1=Y 2=Z
             {
-                Transform t = treadTriggerCapsule.transform;
-                switch (treadTriggerCapsule.direction) // 0=X 1=Y 2=Z
-                {
-                    case 0: axisWorld = t.right;   break;
-                    case 1: axisWorld = t.up;      break;
-                    case 2: axisWorld = t.forward; break;
-                }
-
-                // 2) 宽度缩放：也用胶囊自己的缩放（避免父子层级不一致）
-                Vector3 s = t.lossyScale;
-                float axisScale =
-                    (treadTriggerCapsule.direction == 0) ? Mathf.Abs(s.x) :
-                    (treadTriggerCapsule.direction == 1) ? Mathf.Abs(s.y) :
-                                                        Mathf.Abs(s.z);
-
-                axisWorld.Normalize();
-                halfW = 0.5f * treadWidth * axisScale;
+                case 0: axisWorld = t.right;   break;
+                case 1: axisWorld = t.up;      break;
+                case 2: axisWorld = t.forward; break;
             }
-            else
-            {
-                // fallback：没有胶囊时才用脚本 transform
-                axisWorld = GetWheelAxisWorld().normalized;
-                halfW = 0.5f * treadWidth * GetAxisScaleWorld();
-            }
+
+            // 2) 宽度缩放：也用胶囊自己的缩放（避免父子层级不一致）
+            Vector3 s = t.lossyScale;
+            float axisScale =
+                (treadTriggerCapsule.direction == 0) ? Mathf.Abs(s.x) :
+                (treadTriggerCapsule.direction == 1) ? Mathf.Abs(s.y) :
+                                                    Mathf.Abs(s.z);
+
+            axisWorld.Normalize();
+            halfW = 0.5f * treadWidth * axisScale;
         }
+        else
+        {
+            // fallback：没有胶囊时才用脚本 transform
+            axisWorld = GetWheelAxisWorld().normalized;
+            halfW = 0.5f * treadWidth * GetAxisScaleWorld();
+        }
+    }
 
 
         // ===== 单接触点：选 penetration 最大的那个 =====
@@ -383,6 +390,12 @@ public class RubberTireWheelScript : BlockScript
 
             if (dbgPointSphere != null) dbgPointSphere.transform.position = pBest;
 
+            // 踏面宽度范围：两侧圆环 + 轮轴线（用于检查裁切方向/宽度是否正确）
+            if (doClip && debugDrawTreadRange)
+            {
+                DrawTreadRangeDebug(center, axisWorld, halfW, R);
+            }
+
             // 线宽可能被 UI 改了，需要实时同步
             ApplyLineWidthsIfReady();
         }
@@ -520,6 +533,46 @@ public class RubberTireWheelScript : BlockScript
     }
 
     // =========================
+    // Debug：显示踏面裁切范围（两侧圆环 + 轮轴线）
+    // =========================
+    private void DrawTreadRangeDebug(Vector3 center, Vector3 axisWorldUnit, float halfW, float radius)
+    {
+        if (radius <= 1e-5f) return;
+        if (axisWorldUnit.sqrMagnitude < 1e-8f) return;
+        axisWorldUnit.Normalize();
+
+        // 轴线（黄色）
+        float axisLen = Mathf.Max(radius * 0.5f, radius * treadAxisDebugLen);
+        Debug.DrawLine(center - axisWorldUnit * axisLen, center + axisWorldUnit * axisLen, Color.yellow);
+
+        // 计算圆环所在平面的基底 u/v（都与 axis 正交）
+        Vector3 u = Vector3.Cross(axisWorldUnit, Vector3.up);
+        if (u.sqrMagnitude < 1e-6f) u = Vector3.Cross(axisWorldUnit, Vector3.right);
+        u.Normalize();
+        Vector3 v = Vector3.Cross(axisWorldUnit, u).normalized;
+
+        // 两侧边界圆环（青色）：center ± axis * halfW
+        Vector3 c0 = center + axisWorldUnit * halfW;
+        Vector3 c1 = center - axisWorldUnit * halfW;
+        int seg = Mathf.Clamp(treadRangeSegments, 8, 128);
+        DrawCircleDebug(c0, u, v, radius, seg, Color.cyan);
+        DrawCircleDebug(c1, u, v, radius, seg, Color.cyan);
+    }
+
+    private void DrawCircleDebug(Vector3 center, Vector3 u, Vector3 v, float r, int segments, Color color)
+    {
+        float step = (Mathf.PI * 2f) / segments;
+        Vector3 prev = center + u * r;
+        for (int i = 1; i <= segments; i++)
+        {
+            float a = step * i;
+            Vector3 p = center + (Mathf.Cos(a) * u + Mathf.Sin(a) * v) * r;
+            Debug.DrawLine(prev, p, color);
+            prev = p;
+        }
+    }
+
+    // =========================
     // 找到踏面 trigger capsule
     // =========================
     private CapsuleCollider FindTreadTriggerCapsule()
@@ -634,6 +687,24 @@ public class RubberTireWheelScript : BlockScript
         if (lr == null) return;
         lr.SetPosition(0, a);
         lr.SetPosition(1, b);
+    }
+
+    private void MakeOrthoBasis(Vector3 axisUnit, out Vector3 u, out Vector3 v)
+    {
+        // 找一个不与 axis 平行的参考向量
+        Vector3 refVec = (Mathf.Abs(axisUnit.y) < 0.9f) ? Vector3.up : Vector3.right;
+        u = Vector3.Cross(axisUnit, refVec);
+        float um = u.magnitude;
+        if (um < 1e-6f)
+        {
+            refVec = Vector3.forward;
+            u = Vector3.Cross(axisUnit, refVec);
+            um = u.magnitude;
+        }
+        u /= Mathf.Max(1e-6f, um);
+        v = Vector3.Cross(axisUnit, u);
+        float vm = v.magnitude;
+        v /= Mathf.Max(1e-6f, vm);
     }
 
     private void ShowDebugObjects()

@@ -12,7 +12,7 @@
 	<Mesh name="WheelMesh"> <!-- Must be defined as a resource in the manifest. -->
 		<Position x="0.0" y="0.0" z="0.5" />
 		<Rotation x="0.0" y="180" z="0" />
-		<Scale x="1.0" y="1.0" z="2.5" />
+		<Scale x="1.0" y="1.0" z="1.5" />
 	</Mesh>
 	
 	<Texture name="WheelTex" /> <!-- Must be defined as a resource in the manifest. -->
