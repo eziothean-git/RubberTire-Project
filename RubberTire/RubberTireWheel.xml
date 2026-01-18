@@ -75,20 +75,22 @@
 
 		<Toggle displayName="Auto-Brake" key="auto-brake" default="true" />
 
-		<Slider displayName="K (Spring)" key="k" min="0" max="20000" default="3000" unclamped="true" />
-		<Slider displayName="C (Damper)" key="c" min="0" max="200" default="25" unclamped="true" />
+		<Slider displayName="K (Spring)" key="k" min="0" max="20000" default="3500" unclamped="true" />
+		<Slider displayName="C (Damper)" key="c" min="0" max="200" default="50" unclamped="true" />
 
 		<Slider displayName="Mu" key="mu" min="0" max="3" default="1.1" unclamped="true" />
 		<Slider displayName="Cx" key="cx" min="0" max="80000" default="20000" unclamped="true" />
 		<Slider displayName="Cy" key="cy" min="0" max="80000" default="25000" unclamped="true" />
 
 		<Toggle displayName="Debug Draw" key="dbg" default="true" />
-		<Slider displayName="Line Width" key="lw" min="0.01" max="0.3" default="0.08" unclamped="true" />
-		<Slider displayName="Force Scale" key="fs" min="0.00001" max="0.01" default="0.0008" unclamped="true" />
+		<Slider displayName="Line Width" key="lw" min="0.01" max="0.3" default="0.1" unclamped="true" />
+		<Slider displayName="Force Scale" key="fs" min="0.00001" max="0.01" default="0.0015" unclamped="true" />
 
 		<!-- Tread width clipping: cut the spherical contact volume into a finite-width "disc" -->
 		<Toggle displayName="Tread Width Clip" key="tw-clip" default="true" />
-		<Slider displayName="Tread Width" key="tw" min="0.05" max="5" default="1.0" unclamped="true" />
+		<Slider displayName="Tread Width" key="tw" min="0.25" max="2" default="1.0" unclamped="true" />
+
+		<Toggle displayName="Tread Viz Only" key="treadVizOnly" default="false" />
 
 	</ModuleMapperTypes>
 

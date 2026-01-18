@@ -21,7 +21,7 @@ public class RubberTireWheelScript : BlockScript
 
     public bool enableTireModel = true;    // 是否启用轮胎摩擦模型（真实模型）
 
-    public float mu = 1.1f;                // 峰值摩擦系数
+    public float mu = 1.25f;                // 峰值摩擦系数
     public float Cx = 20000f;              // 纵向滑移刚度（N）
     public float Cy = 25000f;              // 侧偏刚度（N/rad）
 
@@ -58,7 +58,7 @@ public class RubberTireWheelScript : BlockScript
 
     public float normalArrowLen = 0.6f;
 
-    public float forceToLength = 0.0008f;  // 力->长度映射
+    public float forceToLength = 0.015f;  // 力->长度映射
     public float arrowMinLen = 0.25f;
     public float arrowMaxLen = 4.0f;
 
@@ -68,6 +68,7 @@ public class RubberTireWheelScript : BlockScript
     // Debug：踏面裁切范围可视化
     // =========================
     public bool debugDrawTreadRange = true;  // 显示踏面宽度范围（两侧圆环 + 轮轴线）
+    public bool treadVizOnly = false;        // 仅显示踏面范围与轴线（隐藏力/法向等其他 debug 线，便于观察）
     public int treadRangeSegments = 28;      // 圆环分段数
     public float treadAxisDebugLen = 2.0f;   // 轮轴线长度（乘以 R 再显示）
 
@@ -92,6 +93,10 @@ public class RubberTireWheelScript : BlockScript
     private LineRenderer lrNormal;
     private LineRenderer lrForceN;
     private LineRenderer lrForceT;
+    // Debug：踏面范围（轴线 + 两侧圆环）——使用 LineRenderer（游戏内可见，老 Unity API 兼容）
+    private LineRenderer lrTreadAxis;
+    private LineRenderer lrTreadRingA;
+    private LineRenderer lrTreadRingB;
     private GameObject dbgPointSphere;
 
     // ----------- 生命周期 -----------
@@ -370,30 +375,61 @@ public class RubberTireWheelScript : BlockScript
             EnsureDebugObjects();
             ShowDebugObjects();
 
-            SetLine(lrCenterToP, center, pBest);
-            SetLine(lrNormal, pBest, pBest + nBest * normalArrowLen);
-
-            float nLen = Mathf.Clamp(Fn * forceToLength, arrowMinLen, arrowMaxLen);
-            SetLine(lrForceN, pBest, pBest + nBest * nLen);
-
-            float tMag = Ftire.magnitude;
-            if (tMag > 1e-3f)
+            // 如果启用“仅踏面可视化”，先把其他线条/点隐藏掉，避免和力矢量重叠看不清
+            if (treadVizOnly)
             {
-                Vector3 tDir = Ftire / tMag;
-                float tLen = Mathf.Clamp(tMag * forceToLength, arrowMinLen, arrowMaxLen);
-                SetLine(lrForceT, pBest, pBest + tDir * tLen);
+                SetLRVisible(lrCenterToP, false);
+                SetLRVisible(lrNormal, false);
+                SetLRVisible(lrForceN, false);
+                SetLRVisible(lrForceT, false);
+                if (dbgPointSphere != null) dbgPointSphere.SetActive(false);
             }
             else
             {
-                SetLine(lrForceT, pBest, pBest);
+                SetLRVisible(lrCenterToP, true);
+                SetLRVisible(lrNormal, true);
+                SetLRVisible(lrForceN, true);
+                SetLRVisible(lrForceT, true);
+                if (dbgPointSphere != null) dbgPointSphere.SetActive(true);
             }
 
-            if (dbgPointSphere != null) dbgPointSphere.transform.position = pBest;
+            // 非“仅踏面可视化”时才画力/法向等
+            if (!treadVizOnly)
+            {
+                SetLine(lrCenterToP, center, pBest);
+                SetLine(lrNormal, pBest, pBest + nBest * normalArrowLen);
+
+                float nLen = Mathf.Clamp(Fn * forceToLength, arrowMinLen, arrowMaxLen);
+                SetLine(lrForceN, pBest, pBest + nBest * nLen);
+
+                float tMag = Ftire.magnitude;
+                if (tMag > 1e-3f)
+                {
+                    Vector3 tDir = Ftire / tMag;
+                    float tLen = Mathf.Clamp(tMag * forceToLength, arrowMinLen, arrowMaxLen);
+                    SetLine(lrForceT, pBest, pBest + tDir * tLen);
+                }
+                else
+                {
+                    SetLine(lrForceT, pBest, pBest);
+                }
+
+                if (dbgPointSphere != null) dbgPointSphere.transform.position = pBest;
+            }
 
             // 踏面宽度范围：两侧圆环 + 轮轴线（用于检查裁切方向/宽度是否正确）
             if (doClip && debugDrawTreadRange)
             {
+                SetLRVisible(lrTreadAxis, true);
+                SetLRVisible(lrTreadRingA, true);
+                SetLRVisible(lrTreadRingB, true);
                 DrawTreadRangeDebug(center, axisWorld, halfW, R);
+            }
+            else
+            {
+                SetLRVisible(lrTreadAxis, false);
+                SetLRVisible(lrTreadRingA, false);
+                SetLRVisible(lrTreadRingB, false);
             }
 
             // 线宽可能被 UI 改了，需要实时同步
@@ -443,6 +479,9 @@ public class RubberTireWheelScript : BlockScript
         if (lrNormal != null) lrNormal.SetWidth(thinLineWidth, thinLineWidth);
         if (lrForceN != null) lrForceN.SetWidth(forceLineWidth, forceLineWidth);
         if (lrForceT != null) lrForceT.SetWidth(forceLineWidth, forceLineWidth);
+        if (lrTreadAxis != null) lrTreadAxis.SetWidth(thinLineWidth, thinLineWidth);
+        if (lrTreadRingA != null) lrTreadRingA.SetWidth(thinLineWidth, thinLineWidth);
+        if (lrTreadRingB != null) lrTreadRingB.SetWidth(thinLineWidth, thinLineWidth);
     }
 
     // =========================
@@ -541,9 +580,12 @@ public class RubberTireWheelScript : BlockScript
         if (axisWorldUnit.sqrMagnitude < 1e-8f) return;
         axisWorldUnit.Normalize();
 
+        // 使用 LineRenderer 画（游戏内可见）；若 debug 对象未初始化则直接返回
+        if (lrTreadAxis == null || lrTreadRingA == null || lrTreadRingB == null) return;
+
         // 轴线（黄色）
         float axisLen = Mathf.Max(radius * 0.5f, radius * treadAxisDebugLen);
-        Debug.DrawLine(center - axisWorldUnit * axisLen, center + axisWorldUnit * axisLen, Color.yellow);
+        SetLine(lrTreadAxis, center - axisWorldUnit * axisLen, center + axisWorldUnit * axisLen);
 
         // 计算圆环所在平面的基底 u/v（都与 axis 正交）
         Vector3 u = Vector3.Cross(axisWorldUnit, Vector3.up);
@@ -551,12 +593,27 @@ public class RubberTireWheelScript : BlockScript
         u.Normalize();
         Vector3 v = Vector3.Cross(axisWorldUnit, u).normalized;
 
-        // 两侧边界圆环（青色）：center ± axis * halfW
+        // 两侧边界圆环（青色）：center ± axis * halfW（闭合 polyline：seg+1 点）
+        int seg = Mathf.Clamp(treadRangeSegments, 8, 128);
+        int count = seg + 1;
+        lrTreadRingA.SetVertexCount(count);
+        lrTreadRingB.SetVertexCount(count);
+
         Vector3 c0 = center + axisWorldUnit * halfW;
         Vector3 c1 = center - axisWorldUnit * halfW;
-        int seg = Mathf.Clamp(treadRangeSegments, 8, 128);
-        DrawCircleDebug(c0, u, v, radius, seg, Color.cyan);
-        DrawCircleDebug(c1, u, v, radius, seg, Color.cyan);
+        SetCircleLine(lrTreadRingA, c0, u, v, radius, seg);
+        SetCircleLine(lrTreadRingB, c1, u, v, radius, seg);
+    }
+
+    private void SetCircleLine(LineRenderer lr, Vector3 center, Vector3 u, Vector3 v, float r, int segments)
+    {
+        if (lr == null) return;
+        for (int i = 0; i <= segments; i++)
+        {
+            float a = (Mathf.PI * 2f) * ((float)i / (float)segments);
+            Vector3 p = center + (Mathf.Cos(a) * u + Mathf.Sin(a) * v) * r;
+            lr.SetPosition(i, p);
+        }
     }
 
     private void DrawCircleDebug(Vector3 center, Vector3 u, Vector3 v, float r, int segments, Color color)
@@ -622,6 +679,12 @@ public class RubberTireWheelScript : BlockScript
         lrForceN    = CreateLine("L_forceN",   Color.red,   forceLineWidth);
         lrForceT    = CreateLine("L_forceT",   Color.blue,  forceLineWidth);
 
+        // 踏面范围：轮轴线（2 点）+ 两侧圆环（polyline，seg+1 点闭合）
+        lrTreadAxis = CreateLine("L_tread_axis", Color.yellow, thinLineWidth);
+        int seg = Mathf.Clamp(treadRangeSegments, 8, 128);
+        lrTreadRingA = CreatePolyline("L_tread_ringA", Color.cyan, thinLineWidth, seg + 1);
+        lrTreadRingB = CreatePolyline("L_tread_ringB", Color.cyan, thinLineWidth, seg + 1);
+
         dbgPointSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
         dbgPointSphere.name = "P_contact";
         dbgPointSphere.transform.SetParent(dbgRoot.transform, false);
@@ -681,12 +744,39 @@ public class RubberTireWheelScript : BlockScript
         return lr;
     }
 
+    // 老 Unity：用 LineRenderer 画多段折线（polyline），用于踏面圆环
+    private LineRenderer CreatePolyline(string name, Color color, float width, int vertexCount)
+    {
+        var go = new GameObject(name);
+        go.transform.SetParent(dbgRoot.transform, false);
+
+        var lr = go.AddComponent<LineRenderer>();
+        lr.useWorldSpace = true;
+
+        int vc = Mathf.Max(2, vertexCount);
+        lr.SetVertexCount(vc);
+        lr.SetWidth(width, width);
+        lr.SetColors(color, color);
+        lr.material = CreateColorMaterial(color);
+
+        // 初始化顶点，避免未写入时某些版本出现随机线段
+        for (int i = 0; i < vc; i++) lr.SetPosition(i, Vector3.zero);
+        return lr;
+    }
+
 
     private void SetLine(LineRenderer lr, Vector3 a, Vector3 b)
     {
         if (lr == null) return;
         lr.SetPosition(0, a);
         lr.SetPosition(1, b);
+    }
+
+    // 老 Unity：用 enabled 开关控制 LineRenderer 是否显示
+    private void SetLRVisible(LineRenderer lr, bool visible)
+    {
+        if (lr == null) return;
+        lr.enabled = visible;
     }
 
     private void MakeOrthoBasis(Vector3 axisUnit, out Vector3 u, out Vector3 v)
@@ -727,6 +817,9 @@ public class RubberTireWheelScript : BlockScript
             lrNormal = null;
             lrForceN = null;
             lrForceT = null;
+            lrTreadAxis = null;
+            lrTreadRingA = null;
+            lrTreadRingB = null;
             dbgPointSphere = null;
         }
     }
