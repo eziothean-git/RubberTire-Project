@@ -92,7 +92,8 @@ public class RubberTireWheelScript : BlockScript
     public override void SafeAwake()
     {
         // 用官方 Mapper UI 暴露参数（如果你已经在 XML 定义了同 key，可能会出现重复项；不想重复就删掉这段）
-        //uiK = AddSlider("k", "K (Spring)", springK, 0f, 20000f);
+        //uiK = AddSlider("
+        // k", "K (Spring)", springK, 0f, 20000f);
         //uiC = AddSlider("c", "C (Damper)", damperC, 0f, 200f);
 
         //uiMu = AddSlider("mu", "Mu", mu, 0f, 3f);
@@ -172,14 +173,41 @@ public class RubberTireWheelScript : BlockScript
         Vector3 downDir = useWorldDown ? Vector3.down : -transform.up;
 
         // 踏面裁切参数（世界）
-        Vector3 axisWorld = GetWheelAxisWorld();
+        Vector3 axisWorld = Vector3.right;
         float halfW = 0f;
         bool doClip = enableTreadWidthClip && treadWidth > 0f;
+
         if (doClip)
         {
-            axisWorld.Normalize();
-            halfW = 0.5f * treadWidth * GetAxisScaleWorld();
+            // 1) 轴方向：优先用触发胶囊自己的 direction（最可靠）
+            if (treadTriggerCapsule != null)
+            {
+                Transform t = treadTriggerCapsule.transform;
+                switch (treadTriggerCapsule.direction) // 0=X 1=Y 2=Z
+                {
+                    case 0: axisWorld = t.right;   break;
+                    case 1: axisWorld = t.up;      break;
+                    case 2: axisWorld = t.forward; break;
+                }
+
+                // 2) 宽度缩放：也用胶囊自己的缩放（避免父子层级不一致）
+                Vector3 s = t.lossyScale;
+                float axisScale =
+                    (treadTriggerCapsule.direction == 0) ? Mathf.Abs(s.x) :
+                    (treadTriggerCapsule.direction == 1) ? Mathf.Abs(s.y) :
+                                                        Mathf.Abs(s.z);
+
+                axisWorld.Normalize();
+                halfW = 0.5f * treadWidth * axisScale;
+            }
+            else
+            {
+                // fallback：没有胶囊时才用脚本 transform
+                axisWorld = GetWheelAxisWorld().normalized;
+                halfW = 0.5f * treadWidth * GetAxisScaleWorld();
+            }
         }
+
 
         // ===== 单接触点：选 penetration 最大的那个 =====
         bool hasBest = false;
