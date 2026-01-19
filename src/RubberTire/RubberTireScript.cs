@@ -71,6 +71,13 @@ public class RubberTireWheelScript : BlockScript
     public float driveTorque = 0f;
 
     // =========================
+    // 角速度上限（防止甩飞/打坏连接点）
+    // Unity 默认 maxAngularVelocity 往往很小（~7 rad/s），你已验证需要放大。
+    // 但若完全放开，抓地不足时会空转到极限转速，冲击连接点。
+    // =========================
+    public float maxAngularVelocityLimit = 250f; // rad/s
+
+    // =========================
     // 简易驱动/制动（键盘）：先让模型能跑
     // - 直接对轮子刚体绕轮轴施加扭矩
     // - 不依赖古董 MKey API，使用 UnityEngine.Input
@@ -99,6 +106,12 @@ public class RubberTireWheelScript : BlockScript
     // =========================
     public bool debugDraw = true;
 
+    // DebugViz：轮胎力（Ftire）
+    public bool debugVizTireForce = true;
+
+    // 踏面范围与轴心/接触指示（与 DebugViz 独立）
+    public bool debugVizTreadAndAxis = true;
+
     public float thinLineWidth = 0.05f;    // 细线宽
     public float forceLineWidth = 0.10f;   // 力线宽
 
@@ -109,10 +122,7 @@ public class RubberTireWheelScript : BlockScript
     public float arrowMaxLen = 4.0f;
 
     public int drawEveryFixedSteps = 1;    // 每几帧画一次
-
     // Debug：踏面裁切范围可视化
-    public bool debugDrawTreadRange = true;
-    public bool treadVizOnly = false;      // 仅显示踏面范围与轴线
     public int treadRangeSegments = 28;
     public float treadAxisDebugLen = 2.0f;
 
@@ -120,7 +130,10 @@ public class RubberTireWheelScript : BlockScript
     // UI（Mapper）句柄
     // =========================
     private MSlider uiK, uiC, uiMuS, uiMuK, uiVStatic, uiFTau, uiLineW, uiForceScale, uiTreadW;
-    private MToggle uiDbg, uiTreadClip, uiTreadVizOnly, uiEnableTire;
+    private MToggle uiDbg, uiTreadClip, uiEnableTire;
+
+    // Debug sub-toggles
+    private MToggle uiDbgForce, uiDbgTreadAxis;
 
     private MToggle uiRelax, uiDecouple, uiUseTrigAxis;
     private MSlider uiRelaxL, uiShearK, uiShearC, uiMaxShear;
@@ -130,6 +143,9 @@ public class RubberTireWheelScript : BlockScript
     private MToggle uiInvertDrive;
     private MSlider uiMaxDriveTorque, uiMaxBrakeTorque, uiBrakeDeadband, uiBrakeHoldK;
     private MSlider uiThrottleRise, uiThrottleFall, uiBrakeRise, uiBrakeFall;
+
+    // Angular velocity limit UI
+    private MSlider uiMaxAngVel;
 
     // =========================
     // 运行时状态
@@ -184,12 +200,12 @@ public class RubberTireWheelScript : BlockScript
         uiDecouple = AddToggle("Decouple F/T", "decouple", decoupleTireForceAndTorque);
         uiUseTrigAxis = AddToggle("Use Trigger Axis", "trigAxis", useTriggerCapsuleAxisForWheelAxis);
 
-        uiDbg = AddToggle("Debug Draw", "dbg", debugDraw);
+        uiDbg = AddToggle("Debug Master", "dbg", debugDraw);
+        uiDbgForce = AddToggle("DebugViz: Tire Force", "dbgF", debugVizTireForce);
+        uiDbgTreadAxis = AddToggle("Debug: Tread+Axis", "dbgTA", debugVizTreadAndAxis);
 
         uiTreadClip = AddToggle("Tread Width Clip", "tw-clip", enableTreadWidthClip);
         uiTreadW = AddSlider("Tread Width", "tw", treadWidth, 0.05f, 5f);
-
-        uiTreadVizOnly = AddToggle("Tread Viz Only", "treadVizOnly", treadVizOnly);
 
         uiLineW = AddSlider("Line Width", "lw", forceLineWidth, 0.01f, 0.30f);
         uiForceScale = AddSlider("Force Scale", "fs", forceToLength, 0.00001f, 0.01f);
@@ -205,6 +221,9 @@ public class RubberTireWheelScript : BlockScript
         uiThrottleFall = AddSlider("Throttle Fall", "thrDn", throttleFall, 0f, 40f);
         uiBrakeRise = AddSlider("Brake Rise", "brkUp", brakeRise, 0f, 40f);
         uiBrakeFall = AddSlider("Brake Fall", "brkDn", brakeFall, 0f, 40f);
+
+        // Angular velocity limit (rad/s)
+        uiMaxAngVel = AddSlider("Max Angular Vel (rad/s)", "maxW", maxAngularVelocityLimit, 10f, 1000f);
     }
 
     public override void OnSimulateStart()
@@ -213,7 +232,8 @@ public class RubberTireWheelScript : BlockScript
         fixedStepCounter = 0;
         shearDispWorld = Vector3.zero;
         FtireFiltered = Vector3.zero;
-        Rigidbody.maxAngularVelocity = 1000f; 
+        // Apply angular velocity ceiling (prevents free-spinning to extreme rpm when traction is low)
+        Rigidbody.maxAngularVelocity = Mathf.Max(10f, maxAngularVelocityLimit);
         Rigidbody.angularDrag = 0.05f; 
 
         treadTriggerCapsule = FindTreadTriggerCapsule();
@@ -243,17 +263,15 @@ public class RubberTireWheelScript : BlockScript
 
     public override void SimulateFixedUpdateAlways()
     {
-        if (Rigidbody.maxAngularVelocity < 50f)
-        {
-            // Unity 默认最大角速度较低（常见为 7 rad/s），这里做兜底避免被意外改回。
-            Rigidbody.maxAngularVelocity = 1000f;
-        }
-
         fixedStepCounter++;
 
         if (!IsSimulating || !HasRigidbody) return;
 
         SyncParamsFromUI();
+
+        // 角速度上限：避免抓地不足时空转到极限转速、冲击连接点。
+        // 同时也防止 Unity/其它系统把它改回默认小值。
+        Rigidbody.maxAngularVelocity = Mathf.Max(10f, maxAngularVelocityLimit);
 
         // ===== 0) Drive/Brake (keyboard) =====
         // 目标：先让轮子能在游戏里被“油门/刹车”驱动起来。
@@ -556,24 +574,29 @@ public class RubberTireWheelScript : BlockScript
             EnsureDebugObjects();
             ShowDebugObjects();
 
-            if (treadVizOnly)
-            {
-                SetLRVisible(lrCenterToP, false);
-                SetLRVisible(lrNormal, false);
-                SetLRVisible(lrForceN, false);
-                SetLRVisible(lrForceT, false);
-                if (dbgPointSphere != null) dbgPointSphere.SetActive(false);
-            }
-            else
-            {
-                SetLRVisible(lrCenterToP, true);
-                SetLRVisible(lrNormal, true);
-                SetLRVisible(lrForceN, true);
-                SetLRVisible(lrForceT, true);
-                if (dbgPointSphere != null) dbgPointSphere.SetActive(true);
-            }
+            // 新逻辑：
+            // - DebugViz = 轮胎力 Ftire（独立开关）
+            // - 踏面/轴线范围 = 独立开关
+            // - 接触点/法向/法向力箭头：作为“基础接触信息”，只要 Debug Master 开着就显示
+            //   （你关掉踏面/轴线后仍需要看到接触点与法向力）。
+            bool showForceViz = debugVizTireForce;
+            bool showTreadAxisViz = debugVizTreadAndAxis;
 
-            if (!treadVizOnly)
+            // legacy：若旧开关 debugVizTreadAndAxis 被打开，在 SyncParamsFromUI() 里已映射为：
+            // showGeomViz=true 且 showForceViz=false。
+
+            // 基础接触信息：默认始终显示（由 Debug Master 控制）
+            SetLRVisible(lrCenterToP, true);
+            SetLRVisible(lrNormal, true);
+            SetLRVisible(lrForceN, true);
+
+            // 轮胎力：独立开关
+            SetLRVisible(lrForceT, showForceViz);
+
+            // 接触点球：若无接触则隐藏
+            if (dbgPointSphere != null) dbgPointSphere.SetActive(hasBest);
+
+            if (hasBest)
             {
                 SetLine(lrCenterToP, center, pBest);
                 SetLine(lrNormal, pBest, pBest + nBest * normalArrowLen);
@@ -581,6 +604,19 @@ public class RubberTireWheelScript : BlockScript
                 float nLen = Mathf.Clamp(Fn * forceToLength, arrowMinLen, arrowMaxLen);
                 SetLine(lrForceN, pBest, pBest + nBest * nLen);
 
+                if (dbgPointSphere != null) dbgPointSphere.transform.position = pBest;
+            }
+            else
+            {
+                // 无接触：收起线段，避免显示上一次的残影
+                SetLine(lrCenterToP, center, center);
+                SetLine(lrNormal, center, center);
+                SetLine(lrForceN, center, center);
+                if (showForceViz) SetLine(lrForceT, center, center);
+            }
+
+            if (showForceViz)
+            {
                 float tMag = Ftire.magnitude;
                 if (tMag > 1e-3f)
                 {
@@ -592,11 +628,10 @@ public class RubberTireWheelScript : BlockScript
                 {
                     SetLine(lrForceT, pBest, pBest);
                 }
-
-                if (dbgPointSphere != null) dbgPointSphere.transform.position = pBest;
             }
 
-            if (doClip && debugDrawTreadRange)
+            // 踏面范围/轴线（仅在启用裁切时绘制）
+            if (showTreadAxisViz && doClip)
             {
                 SetLRVisible(lrTreadAxis, true);
                 SetLRVisible(lrTreadRingA, true);
@@ -642,11 +677,12 @@ public class RubberTireWheelScript : BlockScript
         if (uiUseTrigAxis != null) useTriggerCapsuleAxisForWheelAxis = uiUseTrigAxis.IsActive;
 
         if (uiDbg != null) debugDraw = uiDbg.IsActive;
+        if (uiDbgForce != null) debugVizTireForce = uiDbgForce.IsActive;
+        if (uiDbgTreadAxis != null) debugVizTreadAndAxis = uiDbgTreadAxis.IsActive;
 
         if (uiTreadClip != null) enableTreadWidthClip = uiTreadClip.IsActive;
         if (uiTreadW != null) treadWidth = uiTreadW.Value;
 
-        if (uiTreadVizOnly != null) treadVizOnly = uiTreadVizOnly.IsActive;
 
         if (uiLineW != null)
         {
@@ -668,6 +704,8 @@ public class RubberTireWheelScript : BlockScript
         if (uiThrottleFall != null) throttleFall = uiThrottleFall.Value;
         if (uiBrakeRise != null) brakeRise = uiBrakeRise.Value;
         if (uiBrakeFall != null) brakeFall = uiBrakeFall.Value;
+
+        if (uiMaxAngVel != null) maxAngularVelocityLimit = uiMaxAngVel.Value;
     }
 
     private void ApplyLineWidthsIfReady()
