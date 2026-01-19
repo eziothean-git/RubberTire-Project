@@ -165,6 +165,8 @@ public class RubberTireWheelScript : BlockScript
         fixedStepCounter = 0;
         shearDispWorld = Vector3.zero;
         FtireFiltered = Vector3.zero;
+        Rigidbody.maxAngularVelocity = 1000f; 
+        Rigidbody.angularDrag = 0.05f; 
 
         treadTriggerCapsule = FindTreadTriggerCapsule();
 
@@ -193,11 +195,10 @@ public class RubberTireWheelScript : BlockScript
 
     public override void SimulateFixedUpdateAlways()
     {
-        fixedStepCounter++;
-
-        //蜘蛛社我草你妈的为什么这个不暴露在XML里要手动覆盖
         if (Rigidbody.maxAngularVelocity < 50f)
-            Rigidbody.maxAngularVelocity = 1000f;
+        Rigidbody.maxAngularVelocity = 200f;
+
+        fixedStepCounter++;
 
         if (!IsSimulating || !HasRigidbody) return;
 
@@ -322,29 +323,10 @@ public class RubberTireWheelScript : BlockScript
             Vector3 vGround = Vector3.zero;
             if (groundRb != null) vGround = groundRb.GetPointVelocity(pBest);
 
-            // IMPORTANT (Scheme 1, robust):
-            // Avoid using Rigidbody.GetPointVelocity(pBest) directly as "wheel surface velocity",
-            // because Rigidbody.angularVelocity may contain non-wheel components (pitch/yaw of the block),
-            // which can create artificial slip at higher speeds and look like a speed limiter.
-            // Instead, reconstruct the wheel surface velocity at the contact point using:
-            //   - hub linear velocity at wheel center
-            //   - spin about the wheel axis only
-            //   - effective radius vector to the contact point (projected to be perpendicular to the axis)
+            Vector3 vWheel = Rigidbody.GetPointVelocity(pBest);
+            Vector3 vRel = vWheel - vGround;
 
             Vector3 a = GetWheelAxisWorld().normalized;
-
-            Vector3 vHub = Rigidbody.GetPointVelocity(center);
-
-            // effective lever arm from axis to contact point (perpendicular to axis)
-            Vector3 r0 = pBest - center;
-            Vector3 rPerp = r0 - a * Vector3.Dot(r0, a);
-
-            // keep only wheel spin component about axis
-            Vector3 omegaAxis = a * Vector3.Dot(Rigidbody.angularVelocity, a);
-            Vector3 vSpin = Vector3.Cross(omegaAxis, rPerp);
-
-            Vector3 vWheelSurface = vHub + vSpin;
-            Vector3 vRel = vWheelSurface - vGround;
 
             // 纵向/侧向基向量（对镜像更稳定）
             Vector3 f = ProjectOnPlane(Vector3.Cross(nBest, a), nBest);
