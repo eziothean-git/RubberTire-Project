@@ -60,13 +60,39 @@ public class RubberTireWheelScript : BlockScript
 
     // 轮轴方向（局部）
     public enum AxisLocal { X, Y, Z }
-    public AxisLocal wheelAxisLocal = AxisLocal.X;
+    // 注意：你已验证 BasePoint Motion 的自由旋转轴是 Y，因此这里默认用 Y。
+    // 若你的模型/碰撞体确实绕其它轴转，再改这里（或打开 useTriggerCapsuleAxisForWheelAxis）。
+    public AxisLocal wheelAxisLocal = AxisLocal.Y;
 
     // 可选：如果你确认“以 trigger capsule 轴为准”且不会与 BasePoint Motion 冲突，可打开它
     public bool useTriggerCapsuleAxisForWheelAxis = false;
 
     // 可选：测试用驱动扭矩（一般保持 0）
     public float driveTorque = 0f;
+
+    // =========================
+    // 简易驱动/制动（键盘）：先让模型能跑
+    // - 直接对轮子刚体绕轮轴施加扭矩
+    // - 不依赖古董 MKey API，使用 UnityEngine.Input
+    // - 油门/刹车是最小实现：W 油门，S 刹车（可改 KeyCode）
+    // =========================
+    public bool enableDriveBrake = true;
+    // Besiege 默认 W/S 常被相机/移动占用；这里默认用 T/G。
+    public KeyCode throttleKey = KeyCode.T;
+    public KeyCode brakeKey = KeyCode.G;
+
+    // 若发现“油门方向反了”，可勾选反向。
+    public bool invertDriveTorque = false;
+    public float maxDriveTorque = 8000f;   // N*m（按你轮胎/质量缩放）
+    public float maxBrakeTorque = 12000f; // N*m
+    public float brakeDeadbandOmega = 0.5f; // rad/s，低速进入“锁止”模式
+    public float brakeHoldK = 2000f;        // N*m per (rad/s)，低速锁止阻尼
+
+    // 输入平滑（避免突变）
+    public float throttleRise = 8f; // 1/s
+    public float throttleFall = 10f; // 1/s
+    public float brakeRise = 12f; // 1/s
+    public float brakeFall = 14f; // 1/s
 
     // =========================
     // Debug 可视化（会被 UI 调）
@@ -99,6 +125,12 @@ public class RubberTireWheelScript : BlockScript
     private MToggle uiRelax, uiDecouple, uiUseTrigAxis;
     private MSlider uiRelaxL, uiShearK, uiShearC, uiMaxShear;
 
+    // Drive/Brake UI（可选，只调参数，不映射按键）
+    private MToggle uiDriveBrake;
+    private MToggle uiInvertDrive;
+    private MSlider uiMaxDriveTorque, uiMaxBrakeTorque, uiBrakeDeadband, uiBrakeHoldK;
+    private MSlider uiThrottleRise, uiThrottleFall, uiBrakeRise, uiBrakeFall;
+
     // =========================
     // 运行时状态
     // =========================
@@ -111,6 +143,10 @@ public class RubberTireWheelScript : BlockScript
 
     // 切向力输出滤波状态（世界坐标）
     private Vector3 FtireFiltered = Vector3.zero;
+
+    // 键盘油门/刹车状态（0~1）
+    private float throttle01 = 0f;
+    private float brake01 = 0f;
 
     // Debug 对象（保持旧版实现）
     private GameObject dbgRoot;
@@ -157,6 +193,18 @@ public class RubberTireWheelScript : BlockScript
 
         uiLineW = AddSlider("Line Width", "lw", forceLineWidth, 0.01f, 0.30f);
         uiForceScale = AddSlider("Force Scale", "fs", forceToLength, 0.00001f, 0.01f);
+
+        // -------- Drive/Brake (keyboard) parameter UI --------
+        uiDriveBrake = AddToggle("Drive/Brake (Keys)", "drv", enableDriveBrake);
+        uiInvertDrive = AddToggle("Invert Drive Torque", "invDrv", invertDriveTorque);
+        uiMaxDriveTorque = AddSlider("Max Drive Torque", "drvT", maxDriveTorque, 0f, 50000f);
+        uiMaxBrakeTorque = AddSlider("Max Brake Torque", "brkT", maxBrakeTorque, 0f, 80000f);
+        uiBrakeDeadband = AddSlider("Brake Deadband (rad/s)", "brkDb", brakeDeadbandOmega, 0f, 10f);
+        uiBrakeHoldK = AddSlider("Brake Hold K", "brkK", brakeHoldK, 0f, 20000f);
+        uiThrottleRise = AddSlider("Throttle Rise", "thrUp", throttleRise, 0f, 40f);
+        uiThrottleFall = AddSlider("Throttle Fall", "thrDn", throttleFall, 0f, 40f);
+        uiBrakeRise = AddSlider("Brake Rise", "brkUp", brakeRise, 0f, 40f);
+        uiBrakeFall = AddSlider("Brake Fall", "brkDn", brakeFall, 0f, 40f);
     }
 
     public override void OnSimulateStart()
@@ -196,13 +244,63 @@ public class RubberTireWheelScript : BlockScript
     public override void SimulateFixedUpdateAlways()
     {
         if (Rigidbody.maxAngularVelocity < 50f)
-        Rigidbody.maxAngularVelocity = 200f;
+        {
+            // Unity 默认最大角速度较低（常见为 7 rad/s），这里做兜底避免被意外改回。
+            Rigidbody.maxAngularVelocity = 1000f;
+        }
 
         fixedStepCounter++;
 
         if (!IsSimulating || !HasRigidbody) return;
 
         SyncParamsFromUI();
+
+        // ===== 0) Drive/Brake (keyboard) =====
+        // 目标：先让轮子能在游戏里被“油门/刹车”驱动起来。
+        // 重要：这里不改你的轮胎摩擦模型，只是对刚体绕轮轴施加额外扭矩。
+        // 注：若你后续要做真实发动机/传动比/ABS，可以直接替换这里的 tauDrive/tauBrake 计算。
+        {
+            float dt = Time.fixedDeltaTime;
+
+            // 读取按键（不用 MKey，避免旧 API 行为不一致）
+            float targetThr = (enableDriveBrake && Input.GetKey(throttleKey)) ? 1f : 0f;
+            float targetBrk = (enableDriveBrake && Input.GetKey(brakeKey)) ? 1f : 0f;
+
+            // 一阶平滑（避免扭矩突变）
+            float thrRate = (targetThr > throttle01) ? Mathf.Max(0f, throttleRise) : Mathf.Max(0f, throttleFall);
+            float brkRate = (targetBrk > brake01) ? Mathf.Max(0f, brakeRise) : Mathf.Max(0f, brakeFall);
+            throttle01 = Mathf.MoveTowards(throttle01, targetThr, thrRate * dt);
+            brake01 = Mathf.MoveTowards(brake01, targetBrk, brkRate * dt);
+
+            // 轮轴（世界）
+            // 关键：用于“驱动/刹车”扭矩的轴必须与轮子实际自由旋转轴一致。
+            // 最稳是直接使用踏面 trigger capsule 的轴（由 XML 的 Capsule direction + Rotation 决定）。
+            Vector3 aAxis = GetDriveAxisWorld();
+            float omegaAxis = Vector3.Dot(Rigidbody.angularVelocity, aAxis);
+
+            // 驱动扭矩
+            float tau = throttle01 * maxDriveTorque;
+            if (invertDriveTorque) tau = -tau;
+
+            // 制动扭矩：高速为恒定反向，低速进入“锁止”避免符号翻转抖动
+            if (brake01 > 1e-4f)
+            {
+                float tauBMax = brake01 * maxBrakeTorque;
+                if (Mathf.Abs(omegaAxis) > Mathf.Max(1e-4f, brakeDeadbandOmega))
+                {
+                    tau += -Mathf.Sign(omegaAxis) * tauBMax;
+                }
+                else
+                {
+                    // 低速锁止：把 omegaAxis 拉向 0（等价于粘性制动）
+                    float tauHold = -omegaAxis * brakeHoldK;
+                    tau += Mathf.Clamp(tauHold, -tauBMax, tauBMax);
+                }
+            }
+
+            if (Mathf.Abs(tau) > 1e-6f)
+                Rigidbody.AddTorque(aAxis * tau, ForceMode.Force);
+        }
 
         if (contacts.Count == 0)
         {
@@ -439,7 +537,7 @@ public class RubberTireWheelScript : BlockScript
 
                     // 驱动扭矩仍然可以单独沿轴施加（相当于发动机输入）
                     if (Mathf.Abs(driveTorque) > 1e-6f)
-                        Rigidbody.AddTorque(a * driveTorque, ForceMode.Force);
+                        Rigidbody.AddTorque(GetDriveAxisWorld() * driveTorque, ForceMode.Force);
                 }
                 else
                 {
@@ -447,7 +545,7 @@ public class RubberTireWheelScript : BlockScript
                     if (groundRb != null) groundRb.AddForceAtPosition(-Ftire, pBest, ForceMode.Force);
 
                     if (Mathf.Abs(driveTorque) > 1e-6f)
-                        Rigidbody.AddTorque(a * driveTorque, ForceMode.Force);
+                        Rigidbody.AddTorque(GetDriveAxisWorld() * driveTorque, ForceMode.Force);
                 }
             }
         }
@@ -558,6 +656,18 @@ public class RubberTireWheelScript : BlockScript
         }
 
         if (uiForceScale != null) forceToLength = uiForceScale.Value;
+
+        // Drive/Brake params
+        if (uiDriveBrake != null) enableDriveBrake = uiDriveBrake.IsActive;
+        if (uiInvertDrive != null) invertDriveTorque = uiInvertDrive.IsActive;
+        if (uiMaxDriveTorque != null) maxDriveTorque = uiMaxDriveTorque.Value;
+        if (uiMaxBrakeTorque != null) maxBrakeTorque = uiMaxBrakeTorque.Value;
+        if (uiBrakeDeadband != null) brakeDeadbandOmega = uiBrakeDeadband.Value;
+        if (uiBrakeHoldK != null) brakeHoldK = uiBrakeHoldK.Value;
+        if (uiThrottleRise != null) throttleRise = uiThrottleRise.Value;
+        if (uiThrottleFall != null) throttleFall = uiThrottleFall.Value;
+        if (uiBrakeRise != null) brakeRise = uiBrakeRise.Value;
+        if (uiBrakeFall != null) brakeFall = uiBrakeFall.Value;
     }
 
     private void ApplyLineWidthsIfReady()
@@ -641,6 +751,27 @@ public class RubberTireWheelScript : BlockScript
             case AxisLocal.Z: return transform.forward;
         }
         return transform.right;
+    }
+
+    private Vector3 GetDriveAxisWorld()
+    {
+        // ✅ 最稳：用踏面 trigger capsule 的轴
+        if (treadTriggerCapsule != null)
+        {
+            Transform t = treadTriggerCapsule.transform;
+            Vector3 axis;
+            switch (treadTriggerCapsule.direction) // 0=X 1=Y 2=Z
+            {
+                case 0: axis = t.right; break;
+                case 1: axis = t.up; break;
+                default: axis = t.forward; break;
+            }
+            if (axis.sqrMagnitude > 1e-10f) return axis.normalized;
+        }
+
+        // 兜底：回退到原 GetWheelAxisWorld（但建议你尽量让上面生效）
+        Vector3 a = GetWheelAxisWorld();
+        return (a.sqrMagnitude > 1e-10f) ? a.normalized : transform.up;
     }
 
     private float GetAxisScaleWorld()
