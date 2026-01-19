@@ -5,9 +5,11 @@ using Modding;
 /// <summary>
 /// RubberTireWheelScript
 /// - 单接触点（pen 最大）
-/// - 法向弹簧阻尼 + 轮胎摩擦（kappa/alpha -> Fx/Fy -> 摩擦圆）
-/// - Debug 可视化（点/线）
-/// - 游戏内 UI 调参（K/C/mu/Cx/Cy/线宽/力缩放/Debug 开关/踏面裁切/仅踏面可视化）
+/// - 法向弹簧阻尼 + 轮胎摩擦（Bristle/静-动摩擦，基于接触点相对速度）
+/// - 轮胎切向松弛/形变：剪切位移状态 + 弹簧-阻尼（低通）
+/// - 反驱友好：切向力/轴向扭矩分离（AddForce + AddTorque）
+/// - Debug 可视化（旧版 LineRenderer API：SetVertexCount/SetWidth/SetColors）
+/// - 游戏内 UI 调参
 /// </summary>
 public class RubberTireWheelScript : BlockScript
 {
@@ -19,13 +21,29 @@ public class RubberTireWheelScript : BlockScript
     public float maxNormalForce = 200000f; // 法向力上限
 
     public bool enableTireModel = true;    // 是否启用轮胎摩擦模型
-
-    public float mu = 1.25f;               // 峰值摩擦系数
-    public float Cx = 20000f;              // 纵向滑移刚度（N）
-    public float Cy = 25000f;              // 侧偏刚度（N/rad）
+    // =========================
+    // 静/动摩擦 + 输出滤波（解决低速抖动/低速粘滞）
+    // =========================
+    public float muStatic = 1.40f;         // 静摩擦峰值系数 μs（应 >= μk）
+    public float muKinetic = 1.20f;        // 动摩擦系数 μk
+    public float vStatic = 0.25f;          // 静摩擦锁定速度阈值（m/s），越大越“稳”但更粘
+    public float forceFilterTau = 0.03f;   // 输出切向力滤波时间常数（s），0 表示关闭
 
     public float vEps = 0.2f;              // 速度防除零
-    public float vBlend = 0.5f;            // 低速衰减：V/(V+vBlend)
+    // =========================
+    // 切向松弛/形变（低通）
+    // =========================
+    public bool enableTireRelaxation = true;  // 是否启用松弛
+    public float relaxLength = 0.8f;         // 松弛长度（世界单位，约等于轮胎形变建立的距离）
+    public float shearK = 50000f;             // 剪切刚度（N/m）
+    public float shearC = 0f;                 // 剪切阻尼（N*s/m），0 表示只用 relaxLength/speed 的一阶耗散
+    public float maxShearDisp = 0.15f;        // 形变位移上限（m）
+    public bool resetShearOnNoContact = true; // 无接触时是否清零形变
+
+    // =========================
+    // 反驱：力/扭矩分离
+    // =========================
+    public bool decoupleTireForceAndTorque = true;
 
     // =========================
     // 踏面裁切（把球形触发域裁成“有限宽度圆柱体”）
@@ -44,7 +62,10 @@ public class RubberTireWheelScript : BlockScript
     public enum AxisLocal { X, Y, Z }
     public AxisLocal wheelAxisLocal = AxisLocal.X;
 
-    // 可选：测试用驱动扭矩（一般保持 0，使用 Spinning 模块驱动）
+    // 可选：如果你确认“以 trigger capsule 轴为准”且不会与 BasePoint Motion 冲突，可打开它
+    public bool useTriggerCapsuleAxisForWheelAxis = false;
+
+    // 可选：测试用驱动扭矩（一般保持 0）
     public float driveTorque = 0f;
 
     // =========================
@@ -72,8 +93,11 @@ public class RubberTireWheelScript : BlockScript
     // =========================
     // UI（Mapper）句柄
     // =========================
-    private MSlider uiK, uiC, uiMu, uiCx, uiCy, uiLineW, uiForceScale, uiTreadW;
+    private MSlider uiK, uiC, uiMuS, uiMuK, uiVStatic, uiFTau, uiLineW, uiForceScale, uiTreadW;
     private MToggle uiDbg, uiTreadClip, uiTreadVizOnly, uiEnableTire;
+
+    private MToggle uiRelax, uiDecouple, uiUseTrigAxis;
+    private MSlider uiRelaxL, uiShearK, uiShearC, uiMaxShear;
 
     // =========================
     // 运行时状态
@@ -82,7 +106,13 @@ public class RubberTireWheelScript : BlockScript
     private CapsuleCollider treadTriggerCapsule;
     private int fixedStepCounter = 0;
 
-    // Debug 对象
+    // 切向剪切形变状态（世界坐标）
+    private Vector3 shearDispWorld = Vector3.zero;
+
+    // 切向力输出滤波状态（世界坐标）
+    private Vector3 FtireFiltered = Vector3.zero;
+
+    // Debug 对象（保持旧版实现）
     private GameObject dbgRoot;
     private LineRenderer lrCenterToP;
     private LineRenderer lrNormal;
@@ -100,16 +130,23 @@ public class RubberTireWheelScript : BlockScript
 
     public override void SafeAwake()
     {
-        // ✅ 关键修复：把 UI 句柄真正创建出来（否则 uiK/uiMu... 全是 null，UI 改了也不影响脚本）
-        // 如果你选择用 XML <MapperTypes> 来定义脚本 UI，请把这一段注释掉，避免重复。
         uiK = AddSlider("K (Spring)", "k", springK, 0f, 20000f);
         uiC = AddSlider("C (Damper)", "c", damperC, 0f, 200f);
-
-        uiMu = AddSlider("Mu", "mu", mu, 0f, 3f);
-        uiCx = AddSlider("Cx", "cx", Cx, 0f, 80000f);
-        uiCy = AddSlider("Cy", "cy", Cy, 0f, 80000f);
+        uiMuS = AddSlider("Mu Static", "muS", muStatic, 0f, 3f);
+        uiMuK = AddSlider("Mu Kinetic", "muK", muKinetic, 0f, 3f);
+        uiVStatic = AddSlider("vStatic (m/s)", "vStatic", vStatic, 0.01f, 2.0f);
+        uiFTau = AddSlider("Force Filter Tau (s)", "fTau", forceFilterTau, 0f, 0.20f);
 
         uiEnableTire = AddToggle("Tire Model", "tire", enableTireModel);
+
+        uiRelax = AddToggle("Tire Relaxation", "relax", enableTireRelaxation);
+        uiRelaxL = AddSlider("Relax Length", "relaxL", relaxLength, 0.05f, 5.0f);
+        uiShearK = AddSlider("Shear K (N/m)", "shK", shearK, 1000f, 200000f);
+        uiShearC = AddSlider("Shear C (N*s/m)", "shC", shearC, 0f, 5000f);
+        uiMaxShear = AddSlider("Max Shear Disp", "shMax", maxShearDisp, 0.01f, 0.50f);
+
+        uiDecouple = AddToggle("Decouple F/T", "decouple", decoupleTireForceAndTorque);
+        uiUseTrigAxis = AddToggle("Use Trigger Axis", "trigAxis", useTriggerCapsuleAxisForWheelAxis);
 
         uiDbg = AddToggle("Debug Draw", "dbg", debugDraw);
 
@@ -126,8 +163,9 @@ public class RubberTireWheelScript : BlockScript
     {
         contacts.Clear();
         fixedStepCounter = 0;
+        shearDispWorld = Vector3.zero;
+        FtireFiltered = Vector3.zero;
 
-        // 找到本 block 的踏面 trigger capsule，用它来定义轮心/半径
         treadTriggerCapsule = FindTreadTriggerCapsule();
 
         if (ShowDebugVisuals && debugDraw)
@@ -139,6 +177,8 @@ public class RubberTireWheelScript : BlockScript
         contacts.Clear();
         DestroyDebugObjects();
         treadTriggerCapsule = null;
+        shearDispWorld = Vector3.zero;
+        FtireFiltered = Vector3.zero;
     }
 
     public override void OnSimulateTriggerEnter(Collider other)
@@ -155,13 +195,18 @@ public class RubberTireWheelScript : BlockScript
     {
         fixedStepCounter++;
 
+        //蜘蛛社我草你妈的为什么这个不暴露在XML里要手动覆盖
+        if (Rigidbody.maxAngularVelocity < 50f)
+            Rigidbody.maxAngularVelocity = 1000f;
+
         if (!IsSimulating || !HasRigidbody) return;
 
-        // 每个物理帧先同步 UI
         SyncParamsFromUI();
 
         if (contacts.Count == 0)
         {
+            if (resetShearOnNoContact) shearDispWorld = Vector3.zero;
+            if (resetShearOnNoContact) FtireFiltered = Vector3.zero;
             HideDebugObjects();
             return;
         }
@@ -267,13 +312,6 @@ public class RubberTireWheelScript : BlockScript
         Vector3 FnVec = Fn * nBest;
         Rigidbody.AddForceAtPosition(FnVec, pBest, ForceMode.Force);
 
-        // 可选：施加驱动扭矩（一般为 0）
-        if (driveTorque != 0f)
-        {
-            Vector3 aAxis = GetWheelAxisWorld().normalized;
-            Rigidbody.AddTorque(aAxis * driveTorque, ForceMode.Force);
-        }
-
         // ===== 2) 轮胎摩擦模型 =====
         Vector3 Ftire = Vector3.zero;
 
@@ -284,17 +322,34 @@ public class RubberTireWheelScript : BlockScript
             Vector3 vGround = Vector3.zero;
             if (groundRb != null) vGround = groundRb.GetPointVelocity(pBest);
 
-            Vector3 vWheel = Rigidbody.GetPointVelocity(pBest);
-            Vector3 vRel = vWheel - vGround;
+            // IMPORTANT (Scheme 1, robust):
+            // Avoid using Rigidbody.GetPointVelocity(pBest) directly as "wheel surface velocity",
+            // because Rigidbody.angularVelocity may contain non-wheel components (pitch/yaw of the block),
+            // which can create artificial slip at higher speeds and look like a speed limiter.
+            // Instead, reconstruct the wheel surface velocity at the contact point using:
+            //   - hub linear velocity at wheel center
+            //   - spin about the wheel axis only
+            //   - effective radius vector to the contact point (projected to be perpendicular to the axis)
 
             Vector3 a = GetWheelAxisWorld().normalized;
 
-            Vector3 omegaVec = Rigidbody.angularVelocity;
-            Vector3 f0 = Vector3.Cross(omegaVec, -nBest);
-            Vector3 f = ProjectOnPlane(f0, nBest);
+            Vector3 vHub = Rigidbody.GetPointVelocity(center);
 
+            // effective lever arm from axis to contact point (perpendicular to axis)
+            Vector3 r0 = pBest - center;
+            Vector3 rPerp = r0 - a * Vector3.Dot(r0, a);
+
+            // keep only wheel spin component about axis
+            Vector3 omegaAxis = a * Vector3.Dot(Rigidbody.angularVelocity, a);
+            Vector3 vSpin = Vector3.Cross(omegaAxis, rPerp);
+
+            Vector3 vWheelSurface = vHub + vSpin;
+            Vector3 vRel = vWheelSurface - vGround;
+
+            // 纵向/侧向基向量（对镜像更稳定）
+            Vector3 f = ProjectOnPlane(Vector3.Cross(nBest, a), nBest);
             if (f.sqrMagnitude < 1e-6f)
-                f = ProjectOnPlane(Vector3.Cross(nBest, a), nBest);
+                f = ProjectOnPlane(Vector3.Cross(nBest, transform.right), nBest);
 
             if (f.sqrMagnitude < 1e-6f)
             {
@@ -303,49 +358,119 @@ public class RubberTireWheelScript : BlockScript
             else
             {
                 f.Normalize();
-
                 Vector3 sdir = Vector3.Cross(nBest, f);
-                if (sdir.sqrMagnitude > 1e-6f) sdir.Normalize();
+                if (sdir.sqrMagnitude > 1e-6f) sdir.Normalize();            // ---------- 2.1) Bristle 静/动摩擦（方案1：完全基于接触点切向相对速度） ----------
+                // vRel = vWheel(pBest) - vGround(pBest)
+                // vSlip = ProjectOnPlane(vRel, nBest)
+                // 形变状态 shearDispWorld 积分 vSlip，并用弹簧/阻尼输出摩擦力（对 wheel 的作用方向为 -shearK*x - shearC*xDot）
 
-                Vector3 vT = ProjectOnPlane(vRel, nBest);
+                // 接触点切向相对速度 = 滑移速度（核心：不再使用 ωR，因此不受“压陷导致有效半径变化”的系统性误差影响）
+                Vector3 vSlip = ProjectOnPlane(vRel, nBest);
+                float vSlipMag = vSlip.magnitude;
 
-                float Vx = Vector3.Dot(vT, f);
-                float Vy = Vector3.Dot(vT, sdir);
+                // Bristle/松弛
+                Vector3 Fraw;
+                float dt = Time.fixedDeltaTime;
 
-                float omega = Vector3.Dot(omegaVec, a);
-                float Vw = omega * R;
-
-                float V = Mathf.Max(vT.magnitude, vEps);
-
-                float kappa = (Vw - Vx) / V;
-                float alpha = Mathf.Atan2(Vy, Mathf.Abs(Vx) + vEps);
-
-                float Fx0 = Cx * kappa;
-                float Fy0 = -Cy * alpha;
-
-                float Fmax = mu * Fn;
-                float Fmag0 = Mathf.Sqrt(Fx0 * Fx0 + Fy0 * Fy0);
-
-                float Fx = Fx0, Fy = Fy0;
-                if (Fmag0 > Fmax && Fmag0 > 1e-6f)
+                if (enableTireRelaxation)
                 {
-                    float scale = Fmax / Fmag0;
-                    Fx *= scale;
-                    Fy *= scale;
+                    // 松弛长度模型：T = L / |vT|，这里用切向相对速度的大小近似（避免静止时 T 过小）
+                    float speed = Mathf.Max(vSlipMag, vEps);
+                    float T = Mathf.Max(1e-4f, relaxLength / speed);
+
+                    // 一阶松弛：xDot = vSlip - x/T
+                    Vector3 xDot = vSlip - shearDispWorld / T;
+                    shearDispWorld += xDot * dt;
+
+                    // 限制形变位移（物理上是最大剪切形变）
+                    if (maxShearDisp > 1e-5f)
+                    {
+                        float m = shearDispWorld.magnitude;
+                        if (m > maxShearDisp) shearDispWorld = shearDispWorld * (maxShearDisp / m);
+                    }
+
+                    // 摩擦力方向：对 wheel 施加“反向弹力”
+                    Fraw = -shearK * shearDispWorld;
+                    if (shearC > 0f) Fraw += -shearC * xDot;
+
+                    // 静/动摩擦上限
+                    float FmaxS = muStatic * Fn;
+                    float FmaxK = muKinetic * Fn;
+                    float Fmag = Fraw.magnitude;
+
+                    if (vSlipMag < Mathf.Max(1e-3f, vStatic))
+                    {
+                        // 静摩擦锁定区：只要没超过静摩擦上限，就按 bristle 输出（避免低速翻转震荡）
+                        if (Fmag > FmaxS && Fmag > 1e-6f)
+                        {
+                            // 超过静摩擦极限 -> 进入滑移：限制到动摩擦上限
+                            Fraw *= (FmaxK / Fmag);
+
+                            // 关键：把形变重投影到饱和值，避免下一帧立刻反弹
+                            shearDispWorld = -Fraw / Mathf.Max(1e-6f, shearK);
+                        }
+                    }
+                    else
+                    {
+                        // 明显滑移：动摩擦上限
+                        if (Fmag > FmaxK && Fmag > 1e-6f)
+                        {
+                            Fraw *= (FmaxK / Fmag);
+                            shearDispWorld = -Fraw / Mathf.Max(1e-6f, shearK);
+                        }
+                    }
+
+                    // 输出力轻滤波（抑制接触点离散跳动）
+                    if (forceFilterTau > 1e-5f)
+                    {
+                        float aFilt = dt / (forceFilterTau + dt);
+                        FtireFiltered = Vector3.Lerp(FtireFiltered, Fraw, aFilt);
+                        Fraw = FtireFiltered;
+                    }
+                    else
+                    {
+                        FtireFiltered = Fraw;
+                    }
+                }
+                else
+                {
+                    // 关闭松弛时：直接库仑动摩擦（仍基于接触点切向相对速度）
+                    float FmaxK = muKinetic * Fn;
+                    if (vSlipMag > 1e-5f)
+                        Fraw = -vSlip / vSlipMag * FmaxK;
+                    else
+                        Fraw = Vector3.zero;
+
+                    // 同步状态
+                    FtireFiltered = Fraw;
+                    shearDispWorld = Vector3.zero;
                 }
 
-                float w = V / (V + Mathf.Max(1e-4f, vBlend));
-                Fx *= w;
-                Fy *= w;
+                Ftire = Fraw;
+// ---------- 2.4) 反驱：接触点施力（闭合） ----------
+                if (decoupleTireForceAndTorque)
+                {
+                    // 力施加在接触点：自然产生 r×F，实现反驱闭合
+                    Rigidbody.AddForceAtPosition(Ftire, pBest, ForceMode.Force);
+                    if (groundRb != null)
+                        groundRb.AddForceAtPosition(-Ftire, pBest, ForceMode.Force);
 
-                Ftire = Fx * f + Fy * sdir;
+                    // 驱动扭矩仍然可以单独沿轴施加（相当于发动机输入）
+                    if (Mathf.Abs(driveTorque) > 1e-6f)
+                        Rigidbody.AddTorque(a * driveTorque, ForceMode.Force);
+                }
+                else
+                {
+                    Rigidbody.AddForceAtPosition(Ftire, pBest, ForceMode.Force);
+                    if (groundRb != null) groundRb.AddForceAtPosition(-Ftire, pBest, ForceMode.Force);
 
-                Rigidbody.AddForceAtPosition(Ftire, pBest, ForceMode.Force);
-                if (groundRb != null) groundRb.AddForceAtPosition(-Ftire, pBest, ForceMode.Force);
+                    if (Mathf.Abs(driveTorque) > 1e-6f)
+                        Rigidbody.AddTorque(a * driveTorque, ForceMode.Force);
+                }
             }
         }
 
-        // ===== Debug 可视化 =====
+        // ===== Debug 可视化（保持旧版绘制实现）=====
         if (ShowDebugVisuals && debugDraw && (fixedStepCounter % Mathf.Max(1, drawEveryFixedSteps) == 0))
         {
             EnsureDebugObjects();
@@ -420,12 +545,21 @@ public class RubberTireWheelScript : BlockScript
     {
         if (uiK != null) springK = uiK.Value;
         if (uiC != null) damperC = uiC.Value;
-
-        if (uiMu != null) mu = uiMu.Value;
-        if (uiCx != null) Cx = uiCx.Value;
-        if (uiCy != null) Cy = uiCy.Value;
+        if (uiMuS != null) muStatic = uiMuS.Value;
+        if (uiMuK != null) muKinetic = uiMuK.Value;
+        if (uiVStatic != null) vStatic = uiVStatic.Value;
+        if (uiFTau != null) forceFilterTau = uiFTau.Value;
 
         if (uiEnableTire != null) enableTireModel = uiEnableTire.IsActive;
+
+        if (uiRelax != null) enableTireRelaxation = uiRelax.IsActive;
+        if (uiRelaxL != null) relaxLength = uiRelaxL.Value;
+        if (uiShearK != null) shearK = uiShearK.Value;
+        if (uiShearC != null) shearC = uiShearC.Value;
+        if (uiMaxShear != null) maxShearDisp = uiMaxShear.Value;
+
+        if (uiDecouple != null) decoupleTireForceAndTorque = uiDecouple.IsActive;
+        if (uiUseTrigAxis != null) useTriggerCapsuleAxisForWheelAxis = uiUseTrigAxis.IsActive;
 
         if (uiDbg != null) debugDraw = uiDbg.IsActive;
 
@@ -505,6 +639,19 @@ public class RubberTireWheelScript : BlockScript
     // =========================
     private Vector3 GetWheelAxisWorld()
     {
+        if (useTriggerCapsuleAxisForWheelAxis && treadTriggerCapsule != null)
+        {
+            Transform t = treadTriggerCapsule.transform;
+            Vector3 axisWorld;
+            switch (treadTriggerCapsule.direction) // 0=X 1=Y 2=Z
+            {
+                case 0: axisWorld = t.right; break;
+                case 1: axisWorld = t.up; break;
+                default: axisWorld = t.forward; break;
+            }
+            if (axisWorld.sqrMagnitude > 1e-10f) return axisWorld.normalized;
+        }
+
         switch (wheelAxisLocal)
         {
             case AxisLocal.X: return transform.right;
@@ -538,7 +685,7 @@ public class RubberTireWheelScript : BlockScript
     }
 
     // =========================
-    // Debug：显示踏面裁切范围（两侧圆环 + 轮轴线）
+    // Debug：显示踏面裁切范围（两侧圆环 + 轮轴线）——保持旧版
     // =========================
     private void DrawTreadRangeDebug(Vector3 center, Vector3 axisWorldUnit, float halfW, float radius)
     {
@@ -612,7 +759,7 @@ public class RubberTireWheelScript : BlockScript
     }
 
     // =========================
-    // Debug 可视化：对象创建/销毁
+    // Debug 可视化：对象创建/销毁 ——保持旧版（古董 API）
     // =========================
     private void EnsureDebugObjects()
     {
