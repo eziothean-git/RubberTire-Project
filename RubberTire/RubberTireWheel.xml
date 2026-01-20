@@ -30,7 +30,7 @@
 		 to be displayed. The child elements define how and where it is displayed. -->
 	<Arrow>
 		<Position x="0" y="0" z="1" />
-		<Rotation x="0" y="0" z="0" />
+		<Rotation x="0" y="180" z="0" />
 		<Scale x="2.5" y="2.5" z="2.5" />
 	</Arrow>
 	

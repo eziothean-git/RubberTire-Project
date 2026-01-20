@@ -78,15 +78,11 @@ public class RubberTireWheelScript : BlockScript
     public float maxAngularVelocityLimit = 250f; // rad/s
 
     // =========================
-    // 简易驱动/制动（键盘）：先让模型能跑
-    // - 直接对轮子刚体绕轮轴施加扭矩
-    // - 不依赖古董 MKey API，使用 UnityEngine.Input
-    // - 油门/刹车是最小实现：W 油门，S 刹车（可改 KeyCode）
+    // 简易驱动/制动（可重绑定按键）：先让模型能跑
+    // - 直接对轮子刚体绕轮轴施加扭矩（AddTorque）
+    // - 通过 AddKey 暴露 3 个按键：油门 / 刹车 / 倒车（可在 Mapper 里改键）
     // =========================
     public bool enableDriveBrake = true;
-    // Besiege 默认 W/S 常被相机/移动占用；这里默认用 T/G。
-    public KeyCode throttleKey = KeyCode.T;
-    public KeyCode brakeKey = KeyCode.G;
 
     // 若发现“油门方向反了”，可勾选反向。
     public bool invertDriveTorque = false;
@@ -141,6 +137,7 @@ public class RubberTireWheelScript : BlockScript
     // Drive/Brake UI（可选，只调参数，不映射按键）
     private MToggle uiDriveBrake;
     private MToggle uiInvertDrive;
+    private MKey uiKeyThrottle, uiKeyBrake, uiKeyReverse;
     private MSlider uiMaxDriveTorque, uiMaxBrakeTorque, uiBrakeDeadband, uiBrakeHoldK;
     private MSlider uiThrottleRise, uiThrottleFall, uiBrakeRise, uiBrakeFall;
 
@@ -175,7 +172,6 @@ public class RubberTireWheelScript : BlockScript
     private LineRenderer lrTreadAxis;
     private LineRenderer lrTreadRingA;
     private LineRenderer lrTreadRingB;
-
     private GameObject dbgPointSphere;
 
     // ----------- 生命周期 -----------
@@ -213,14 +209,21 @@ public class RubberTireWheelScript : BlockScript
         // -------- Drive/Brake (keyboard) parameter UI --------
         uiDriveBrake = AddToggle("Drive/Brake (Keys)", "drv", enableDriveBrake);
         uiInvertDrive = AddToggle("Invert Drive Torque", "invDrv", invertDriveTorque);
+
+        // 可重绑定按键（每个轮子实例独立）
+        // 默认：T 油门，G 刹车，R 倒车
+        uiKeyThrottle = AddKey("Throttle Key", "kThr", KeyCode.T);
+        uiKeyBrake = AddKey("Brake Key", "kBrk", KeyCode.G);
+        uiKeyReverse = AddKey("Reverse Key", "kRev", KeyCode.R);
+
         uiMaxDriveTorque = AddSlider("Max Drive Torque", "drvT", maxDriveTorque, 0f, 50000f);
         uiMaxBrakeTorque = AddSlider("Max Brake Torque", "brkT", maxBrakeTorque, 0f, 80000f);
         uiBrakeDeadband = AddSlider("Brake Deadband (rad/s)", "brkDb", brakeDeadbandOmega, 0f, 10f);
         uiBrakeHoldK = AddSlider("Brake Hold K", "brkK", brakeHoldK, 0f, 20000f);
         uiThrottleRise = AddSlider("Throttle Rise", "thrUp", throttleRise, 0f, 40f);
         uiThrottleFall = AddSlider("Throttle Fall", "thrDn", throttleFall, 0f, 40f);
-        uiBrakeRise = AddSlider("Brake Rise", "brkUp", brakeRise, 0f, 40f);
-        uiBrakeFall = AddSlider("Brake Fall", "brkDn", brakeFall, 0f, 40f);
+        uiBrakeRise = AddSlider("Brake Rise 1/s", "brkUp", brakeRise, 0f, 40f);
+        uiBrakeFall = AddSlider("Brake Fall 1/s", "brkDn", brakeFall, 0f, 40f);
 
         // Angular velocity limit (rad/s)
         uiMaxAngVel = AddSlider("Max Angular Vel (rad/s)", "maxW", maxAngularVelocityLimit, 10f, 1000f);
@@ -273,16 +276,20 @@ public class RubberTireWheelScript : BlockScript
         // 同时也防止 Unity/其它系统把它改回默认小值。
         Rigidbody.maxAngularVelocity = Mathf.Max(10f, maxAngularVelocityLimit);
 
-        // ===== 0) Drive/Brake (keyboard) =====
+        // ===== 0) Drive/Brake (remappable keys) =====
         // 目标：先让轮子能在游戏里被“油门/刹车”驱动起来。
         // 重要：这里不改你的轮胎摩擦模型，只是对刚体绕轮轴施加额外扭矩。
         // 注：若你后续要做真实发动机/传动比/ABS，可以直接替换这里的 tauDrive/tauBrake 计算。
         {
             float dt = Time.fixedDeltaTime;
 
-            // 读取按键（不用 MKey，避免旧 API 行为不一致）
-            float targetThr = (enableDriveBrake && Input.GetKey(throttleKey)) ? 1f : 0f;
-            float targetBrk = (enableDriveBrake && Input.GetKey(brakeKey)) ? 1f : 0f;
+            // 读取按键（AddKey -> MKey，可在 Mapper 里改键）
+            bool heldThr = enableDriveBrake && uiKeyThrottle != null && uiKeyThrottle.IsHeld;
+            bool heldBrk = enableDriveBrake && uiKeyBrake != null && uiKeyBrake.IsHeld;
+            bool heldRev = enableDriveBrake && uiKeyReverse != null && uiKeyReverse.IsHeld;
+
+            float targetThr = heldThr ? 1f : 0f;
+            float targetBrk = heldBrk ? 1f : 0f;
 
             // 一阶平滑（避免扭矩突变）
             float thrRate = (targetThr > throttle01) ? Mathf.Max(0f, throttleRise) : Mathf.Max(0f, throttleFall);
@@ -296,9 +303,19 @@ public class RubberTireWheelScript : BlockScript
             Vector3 aAxis = GetDriveAxisWorld();
             float omegaAxis = Vector3.Dot(Rigidbody.angularVelocity, aAxis);
 
-            // 驱动扭矩
-            float tau = throttle01 * maxDriveTorque;
-            if (invertDriveTorque) tau = -tau;
+            // 驱动扭矩（油门）
+            float tauDrive = throttle01 * maxDriveTorque;
+
+            // 建造态 Flip（F 反转）：用于左右镜像轮子方向统一。
+            // XML 已启用 <CanFlip>true</CanFlip> 时，BlockScript 会维护 Flipped 状态。
+            // 这里仅作用于“驱动/制动扭矩”的符号，不影响摩擦/接触模型。
+            float flipSign = Flipped ? -1f : 1f;
+            float userSign = invertDriveTorque ? -1f : 1f;
+            float revSign = heldRev ? -1f : 1f;
+            float driveSign = flipSign * userSign * revSign;
+
+            // 合成扭矩：驱动（带方向）+ 制动（始终反向）
+            float tau = tauDrive * driveSign;
 
             // 制动扭矩：高速为恒定反向，低速进入“锁止”避免符号翻转抖动
             if (brake01 > 1e-4f)
@@ -555,7 +572,10 @@ public class RubberTireWheelScript : BlockScript
 
                     // 驱动扭矩仍然可以单独沿轴施加（相当于发动机输入）
                     if (Mathf.Abs(driveTorque) > 1e-6f)
-                        Rigidbody.AddTorque(GetDriveAxisWorld() * driveTorque, ForceMode.Force);
+                    {
+                        float flipSign = Flipped ? -1f : 1f;
+                        Rigidbody.AddTorque(GetDriveAxisWorld() * (driveTorque * flipSign), ForceMode.Force);
+                    }
                 }
                 else
                 {
@@ -563,7 +583,10 @@ public class RubberTireWheelScript : BlockScript
                     if (groundRb != null) groundRb.AddForceAtPosition(-Ftire, pBest, ForceMode.Force);
 
                     if (Mathf.Abs(driveTorque) > 1e-6f)
-                        Rigidbody.AddTorque(GetDriveAxisWorld() * driveTorque, ForceMode.Force);
+                    {
+                        float flipSign = Flipped ? -1f : 1f;
+                        Rigidbody.AddTorque(GetDriveAxisWorld() * (driveTorque * flipSign), ForceMode.Force);
+                    }
                 }
             }
         }
