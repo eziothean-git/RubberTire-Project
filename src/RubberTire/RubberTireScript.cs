@@ -171,17 +171,50 @@ public class RubberTireWheelScript : BlockScript
     private float throttle01 = 0f;
     private float brake01 = 0f;
 
-    // Debug 对象（不动）
+    // =========================
+    // Debug 可视化（多接触点 + 插值对齐）
+    // - 在 FixedUpdate 里只“采样”要画的东西，并把数据存为 Rigidbody 本地空间
+    // - 在 LateUpdate 里用当前 Rigidbody 的插值 Pose 还原到世界坐标绘制（避免抖动/偏移）
+    // =========================
+
     private GameObject dbgRoot;
-    private LineRenderer lrCenterToP;
-    private LineRenderer lrNormal;
-    private LineRenderer lrForceN;
-    private LineRenderer lrForceT;
+
+    private class DebugPointViz
+    {
+        public GameObject root;
+        public GameObject sphere;
+        public LineRenderer lrCenterToP;
+        public LineRenderer lrNormal;
+        public LineRenderer lrForceN;
+        public LineRenderer lrForceT;
+    }
+
+    private readonly List<DebugPointViz> dbgPoints = new List<DebugPointViz>(8);
 
     private LineRenderer lrTreadAxis;
     private LineRenderer lrTreadRingA;
     private LineRenderer lrTreadRingB;
-    private GameObject dbgPointSphere;
+
+    private struct DebugContactLocalData
+    {
+        public bool active;
+        public Vector3 pLocal;
+        public Vector3 nLocal;
+        public float FnMag;
+        public Vector3 FtLocal;
+        public float FtMag;
+    }
+
+    private DebugContactLocalData[] dbgLocalContacts = new DebugContactLocalData[8];
+    private int dbgLocalCount = 0;
+    private bool dbgHasLocal = false;
+
+    // 本帧（物理）采样到的轮心/踏面裁切信息（全部用 Rigidbody local space 存）
+    private Vector3 dbgCenterLocal = Vector3.zero;
+    private Vector3 dbgAxisLocal = Vector3.right;
+    private float dbgHalfWWorld = 0f;
+    private float dbgRadiusWorld = 1f;
+    private bool dbgDoClip = false;
 
     // Raycast mask cache
     private int contactRayMask = ~0;
@@ -495,7 +528,7 @@ public class RubberTireWheelScript : BlockScript
         {
             // 没命中：全部衰减
             DecayAndCleanupColliderStates();
-            HideDebugObjects();
+            dbgHasLocal = false;
             CleanupPointStates();
             return;
         }
@@ -506,8 +539,24 @@ public class RubberTireWheelScript : BlockScript
         // ===== 3) Apply forces per point =====
         float dtFixed = Time.fixedDeltaTime;
 
-        // For debug, keep the deepest point (topSamples[0]) as “best”
-        ContactSample best = topSamples[0];
+        // Debug：在 FixedUpdate 里采样“要画什么”，并用 Rigidbody local space 存下来。
+        // LateUpdate 用插值后的 Pose 还原到世界坐标画出来。
+        bool doDbgSample = ShowDebugVisuals && debugDraw && (fixedStepCounter % Mathf.Max(1, drawEveryFixedSteps) == 0);
+        Quaternion rbInvRot = Quaternion.identity;
+        Vector3 rbPos = Vector3.zero;
+        if (doDbgSample)
+        {
+            rbPos = Rigidbody.position;
+            rbInvRot = Quaternion.Inverse(Rigidbody.rotation);
+
+            EnsureDebugLocalCapacity(topSamples.Count);
+            dbgLocalCount = 0;
+            dbgCenterLocal = rbInvRot * (center - rbPos);
+            dbgAxisLocal = rbInvRot * axisWorld;
+            dbgHalfWWorld = halfW;
+            dbgRadiusWorld = R;
+            dbgDoClip = doClip;
+        }
 
         for (int i = 0; i < topSamples.Count; i++)
         {
@@ -551,98 +600,117 @@ public class RubberTireWheelScript : BlockScript
             Vector3 FnVec = Fn * nUse;
             Rigidbody.AddForceAtPosition(FnVec, s.p, ForceMode.Force);
 
-            // ---- Tire friction per point ----
-            if (!enableTireModel) continue;
-
-            Rigidbody groundRb = (s.col != null) ? s.col.attachedRigidbody : null;
-
-            Vector3 vGround = Vector3.zero;
-            if (groundRb != null) vGround = groundRb.GetPointVelocity(s.p);
-
-            Vector3 vWheel = Rigidbody.GetPointVelocity(s.p);
-            Vector3 vRel = vWheel - vGround;
-
-            Vector3 f = ProjectOnPlane(Vector3.Cross(nUse, aAxisWheel), nUse);
-            if (f.sqrMagnitude < 1e-6f)
-                f = ProjectOnPlane(Vector3.Cross(nUse, transform.right), nUse);
-
-            if (f.sqrMagnitude < 1e-6f) continue;
-            f.Normalize();
-
-            Vector3 vSlip = ProjectOnPlane(vRel, nUse);
-            float vSlipMag = vSlip.magnitude;
-
+            // ---- Tire friction per point（可选：enableTireModel）----
             Vector3 Ftire = Vector3.zero;
+            Rigidbody groundRb = null;
 
-            if (enableTireRelaxation)
+            if (enableTireModel)
             {
-                TirePointState st = GetOrCreatePointState(s.col, s.p);
-                st.lastSeenStep = fixedStepCounter;
+                groundRb = (s.col != null) ? s.col.attachedRigidbody : null;
 
-                float speed = Mathf.Max(vSlipMag, vEps);
-                float T = Mathf.Max(1e-4f, relaxLength / speed);
+                Vector3 vGround = Vector3.zero;
+                if (groundRb != null) vGround = groundRb.GetPointVelocity(s.p);
 
-                Vector3 xDot = vSlip - st.shearDispWorld / T;
-                st.shearDispWorld += xDot * dtFixed;
+                Vector3 vWheel = Rigidbody.GetPointVelocity(s.p);
+                Vector3 vRel = vWheel - vGround;
 
-                if (maxShearDisp > 1e-5f)
+                // 切向基（沿“滚动前进”方向）
+                Vector3 f = ProjectOnPlane(Vector3.Cross(nUse, aAxisWheel), nUse);
+                if (f.sqrMagnitude < 1e-6f)
+                    f = ProjectOnPlane(Vector3.Cross(nUse, transform.right), nUse);
+
+                if (f.sqrMagnitude > 1e-6f)
                 {
-                    float m = st.shearDispWorld.magnitude;
-                    if (m > maxShearDisp) st.shearDispWorld = st.shearDispWorld * (maxShearDisp / m);
-                }
+                    f.Normalize();
 
-                Vector3 Fraw = -shearK * st.shearDispWorld;
-                if (shearC > 0f) Fraw += -shearC * xDot;
+                    Vector3 vSlip = ProjectOnPlane(vRel, nUse);
+                    float vSlipMag = vSlip.magnitude;
 
-                float FmaxS = muStatic * Fn;   // 注意：Fn 已乘 gate
-                float FmaxK = muKinetic * Fn;  // 注意：Fn 已乘 gate
-                float Fmag = Fraw.magnitude;
-
-                if (vSlipMag < Mathf.Max(1e-3f, vStatic))
-                {
-                    if (Fmag > FmaxS && Fmag > 1e-6f)
+                    if (enableTireRelaxation)
                     {
-                        Fraw *= (FmaxK / Fmag);
-                        st.shearDispWorld = -Fraw / Mathf.Max(1e-6f, shearK);
+                        TirePointState st = GetOrCreatePointState(s.col, s.p);
+                        st.lastSeenStep = fixedStepCounter;
+
+                        float speed = Mathf.Max(vSlipMag, vEps);
+                        float T = Mathf.Max(1e-4f, relaxLength / speed);
+
+                        Vector3 xDot = vSlip - st.shearDispWorld / T;
+                        st.shearDispWorld += xDot * dtFixed;
+
+                        if (maxShearDisp > 1e-5f)
+                        {
+                            float m = st.shearDispWorld.magnitude;
+                            if (m > maxShearDisp) st.shearDispWorld = st.shearDispWorld * (maxShearDisp / m);
+                        }
+
+                        Vector3 Fraw = -shearK * st.shearDispWorld;
+                        if (shearC > 0f) Fraw += -shearC * xDot;
+
+                        float FmaxS = muStatic * Fn;   // 注意：Fn 已乘 gate
+                        float FmaxK = muKinetic * Fn;  // 注意：Fn 已乘 gate
+                        float Fmag = Fraw.magnitude;
+
+                        if (vSlipMag < Mathf.Max(1e-3f, vStatic))
+                        {
+                            if (Fmag > FmaxS && Fmag > 1e-6f)
+                            {
+                                Fraw *= (FmaxK / Fmag);
+                                st.shearDispWorld = -Fraw / Mathf.Max(1e-6f, shearK);
+                            }
+                        }
+                        else
+                        {
+                            if (Fmag > FmaxK && Fmag > 1e-6f)
+                            {
+                                Fraw *= (FmaxK / Fmag);
+                                st.shearDispWorld = -Fraw / Mathf.Max(1e-6f, shearK);
+                            }
+                        }
+
+                        if (forceFilterTau > 1e-5f)
+                        {
+                            float aFilt = dtFixed / (forceFilterTau + dtFixed);
+                            st.FtireFiltered = Vector3.Lerp(st.FtireFiltered, Fraw, aFilt);
+                            Ftire = st.FtireFiltered;
+                        }
+                        else
+                        {
+                            st.FtireFiltered = Fraw;
+                            Ftire = Fraw;
+                        }
+                    }
+                    else
+                    {
+                        float FmaxK = muKinetic * Fn; // Fn 已乘 gate
+                        if (vSlipMag > 1e-5f)
+                            Ftire = -vSlip / vSlipMag * FmaxK;
+                        else
+                            Ftire = Vector3.zero;
+                    }
+
+                    // gate 同样乘到切向（即使 Fn 已 gate，乘一次不会错，只会更“渐变”）
+                    Ftire *= gate;
+
+                    if (Ftire.sqrMagnitude > 1e-10f)
+                    {
+                        Rigidbody.AddForceAtPosition(Ftire, s.p, ForceMode.Force);
+                        if (groundRb != null) groundRb.AddForceAtPosition(-Ftire, s.p, ForceMode.Force);
                     }
                 }
-                else
-                {
-                    if (Fmag > FmaxK && Fmag > 1e-6f)
-                    {
-                        Fraw *= (FmaxK / Fmag);
-                        st.shearDispWorld = -Fraw / Mathf.Max(1e-6f, shearK);
-                    }
-                }
-
-                if (forceFilterTau > 1e-5f)
-                {
-                    float aFilt = dtFixed / (forceFilterTau + dtFixed);
-                    st.FtireFiltered = Vector3.Lerp(st.FtireFiltered, Fraw, aFilt);
-                    Ftire = st.FtireFiltered;
-                }
-                else
-                {
-                    st.FtireFiltered = Fraw;
-                    Ftire = Fraw;
-                }
-            }
-            else
-            {
-                float FmaxK = muKinetic * Fn; // Fn 已乘 gate
-                if (vSlipMag > 1e-5f)
-                    Ftire = -vSlip / vSlipMag * FmaxK;
-                else
-                    Ftire = Vector3.zero;
             }
 
-            // gate 同样乘到切向（即使 Fn 已 gate，乘一次不会错，只会更“渐变”）
-            Ftire *= gate;
-
-            if (Ftire.sqrMagnitude > 1e-10f)
+            // ---- Debug 采样（每个接触点分别画 Fn / Ft / normal / contact point）----
+            if (doDbgSample && dbgLocalCount < dbgLocalContacts.Length)
             {
-                Rigidbody.AddForceAtPosition(Ftire, s.p, ForceMode.Force);
-                if (groundRb != null) groundRb.AddForceAtPosition(-Ftire, s.p, ForceMode.Force);
+                DebugContactLocalData d;
+                d.active = true;
+                d.pLocal = rbInvRot * (s.p - rbPos);
+                d.nLocal = rbInvRot * nUse;
+                d.FnMag = Fn;
+                d.FtLocal = rbInvRot * Ftire;
+                d.FtMag = Ftire.magnitude;
+                dbgLocalContacts[dbgLocalCount] = d;
+                dbgLocalCount++;
             }
         }
 
@@ -653,76 +721,136 @@ public class RubberTireWheelScript : BlockScript
             Rigidbody.AddTorque(GetDriveAxisWorld() * (driveTorque * flipSign), ForceMode.Force);
         }
 
-        // ===== Debug: still render deepest point only (保持轻量，不动) =====
-        if (ShowDebugVisuals && debugDraw && (fixedStepCounter % Mathf.Max(1, drawEveryFixedSteps) == 0))
+        // Debug：本帧是否更新了“本地空间”绘制数据
+        if (doDbgSample)
         {
-            EnsureDebugObjects();
-            ShowDebugObjects();
-
-            bool showForceViz = debugVizTireForce;
-            bool showTreadAxisViz = debugVizTreadAndAxis;
-
-            SetLRVisible(lrCenterToP, true);
-            SetLRVisible(lrNormal, true);
-            SetLRVisible(lrForceN, true);
-            SetLRVisible(lrForceT, showForceViz);
-
-            if (dbgPointSphere != null) dbgPointSphere.SetActive(true);
-
-            // debug 使用过滤后的法向 & gate 后的 Fn（更贴近真实施加的）
-            float gateBest = 1f;
-            Vector3 nBest = best.n;
-            ColliderContactState csBest;
-            if (colStates.TryGetValue(best.colId, out csBest) && csBest != null)
-            {
-                if (enableContactGate) gateBest = Mathf.Clamp01(csBest.gate);
-                if (enableNormalFilter)
-                {
-                    nBest = csBest.nFiltered;
-                    if (Vector3.Dot(nBest, best.n) < 0f) nBest = -nBest;
-                    if (nBest.sqrMagnitude > 1e-12f) nBest.Normalize();
-                    else nBest = best.n;
-                }
-            }
-
-            float FnBest = Mathf.Clamp(springK * best.pen, 0f, maxNormalForce) * gateBest;
-            float nLen = Mathf.Clamp(FnBest * forceToLength, arrowMinLen, arrowMaxLen);
-
-            SetLine(lrCenterToP, center, best.p);
-            SetLine(lrNormal, best.p, best.p + nBest * normalArrowLen);
-            SetLine(lrForceN, best.p, best.p + nBest * nLen);
-
-            if (dbgPointSphere != null) dbgPointSphere.transform.position = best.p;
-
-            if (showForceViz)
-            {
-                SetLine(lrForceT, best.p, best.p);
-            }
-
-            if (showTreadAxisViz && doClip)
-            {
-                SetLRVisible(lrTreadAxis, true);
-                SetLRVisible(lrTreadRingA, true);
-                SetLRVisible(lrTreadRingB, true);
-                DrawTreadRangeDebug(center, axisWorld, halfW, R);
-            }
-            else
-            {
-                SetLRVisible(lrTreadAxis, false);
-                SetLRVisible(lrTreadRingA, false);
-                SetLRVisible(lrTreadRingB, false);
-            }
-
-            ApplyLineWidthsIfReady();
-        }
-        else
-        {
-            HideDebugObjects();
+            dbgHasLocal = (dbgLocalCount > 0);
         }
 
         // 本帧结束：对未见 collider 衰减 gate，并清理
         DecayAndCleanupColliderStates();
         CleanupPointStates();
+    }
+
+    public override void SimulateLateUpdateAlways()
+    {
+        // 只负责渲染：用当前 Rigidbody 的插值 Pose，把 FixedUpdate 缓存的 local 数据还原到世界坐标
+        if (!IsSimulating || !HasRigidbody)
+        {
+            dbgHasLocal = false;
+            HideDebugObjects();
+            return;
+        }
+
+        // Besiege 内置开关 + 我们自己的总开关
+        if (!ShowDebugVisuals || !debugDraw)
+        {
+            HideDebugObjects();
+            return;
+        }
+
+        if (!dbgHasLocal || dbgLocalCount <= 0)
+        {
+            HideDebugObjects();
+            return;
+        }
+
+        EnsureDebugObjects();
+        EnsureDebugPointPool(Mathf.Max(dbgLocalCount, Mathf.Clamp(maxContactPoints, 1, 12)));
+        ShowDebugObjects();
+
+        Vector3 rbPos = Rigidbody.position;
+        Quaternion rbRot = Rigidbody.rotation;
+
+        Vector3 center = rbPos + rbRot * dbgCenterLocal;
+        Vector3 axisWorld = rbRot * dbgAxisLocal;
+        if (axisWorld.sqrMagnitude > 1e-12f) axisWorld.Normalize();
+        else axisWorld = GetWheelAxisWorld();
+
+        bool showForceViz = debugVizTireForce;
+
+        // points
+        for (int i = 0; i < dbgPoints.Count; i++)
+        {
+            bool active = (i < dbgLocalCount) && dbgLocalContacts[i].active;
+            DebugPointViz pv = dbgPoints[i];
+            if (pv == null || pv.root == null) continue;
+            pv.root.SetActive(active);
+            if (!active) continue;
+
+            DebugContactLocalData d = dbgLocalContacts[i];
+
+            Vector3 p = rbPos + rbRot * d.pLocal;
+            Vector3 n = rbRot * d.nLocal;
+            if (n.sqrMagnitude > 1e-12f) n.Normalize();
+            else n = Vector3.up;
+
+            if (pv.sphere != null) pv.sphere.transform.position = p;
+
+            // center -> point
+            if (pv.lrCenterToP != null)
+            {
+                pv.lrCenterToP.enabled = true;
+                SetLine(pv.lrCenterToP, center, p);
+            }
+
+            // normal dir
+            if (pv.lrNormal != null)
+            {
+                pv.lrNormal.enabled = true;
+                SetLine(pv.lrNormal, p, p + n * normalArrowLen);
+            }
+
+            // normal force (support)
+            if (pv.lrForceN != null)
+            {
+                pv.lrForceN.enabled = true;
+                float fnLen = Mathf.Clamp(d.FnMag * forceToLength, arrowMinLen, arrowMaxLen);
+                SetLine(pv.lrForceN, p, p + n * fnLen);
+            }
+
+            // tangential force (friction)
+            if (pv.lrForceT != null)
+            {
+                if (showForceViz && d.FtMag > 1e-6f)
+                {
+                    Vector3 ftW = rbRot * d.FtLocal;
+                    float m = ftW.magnitude;
+                    if (m > 1e-6f)
+                    {
+                        Vector3 tDir = ftW / m;
+                        float ftLen = Mathf.Clamp(d.FtMag * forceToLength, arrowMinLen, arrowMaxLen);
+                        pv.lrForceT.enabled = true;
+                        SetLine(pv.lrForceT, p, p + tDir * ftLen);
+                    }
+                    else
+                    {
+                        pv.lrForceT.enabled = false;
+                    }
+                }
+                else
+                {
+                    pv.lrForceT.enabled = false;
+                }
+            }
+        }
+
+        // tread / axis clip viz (单份)
+        if (debugVizTreadAndAxis && dbgDoClip)
+        {
+            SetLRVisible(lrTreadAxis, true);
+            SetLRVisible(lrTreadRingA, true);
+            SetLRVisible(lrTreadRingB, true);
+            DrawTreadRangeDebug(center, axisWorld, dbgHalfWWorld, dbgRadiusWorld);
+        }
+        else
+        {
+            SetLRVisible(lrTreadAxis, false);
+            SetLRVisible(lrTreadRingA, false);
+            SetLRVisible(lrTreadRingB, false);
+        }
+
+        ApplyLineWidthsIfReady();
     }
 
     // =========================
@@ -1065,10 +1193,15 @@ public class RubberTireWheelScript : BlockScript
 
     private void ApplyLineWidthsIfReady()
     {
-        if (lrCenterToP != null) lrCenterToP.SetWidth(thinLineWidth, thinLineWidth);
-        if (lrNormal != null) lrNormal.SetWidth(thinLineWidth, thinLineWidth);
-        if (lrForceN != null) lrForceN.SetWidth(forceLineWidth, forceLineWidth);
-        if (lrForceT != null) lrForceT.SetWidth(forceLineWidth, forceLineWidth);
+        for (int i = 0; i < dbgPoints.Count; i++)
+        {
+            DebugPointViz p = dbgPoints[i];
+            if (p == null) continue;
+            if (p.lrCenterToP != null) p.lrCenterToP.SetWidth(thinLineWidth, thinLineWidth);
+            if (p.lrNormal != null) p.lrNormal.SetWidth(thinLineWidth, thinLineWidth);
+            if (p.lrForceN != null) p.lrForceN.SetWidth(forceLineWidth, forceLineWidth);
+            if (p.lrForceT != null) p.lrForceT.SetWidth(forceLineWidth, forceLineWidth);
+        }
         if (lrTreadAxis != null) lrTreadAxis.SetWidth(thinLineWidth, thinLineWidth);
         if (lrTreadRingA != null) lrTreadRingA.SetWidth(thinLineWidth, thinLineWidth);
         if (lrTreadRingB != null) lrTreadRingB.SetWidth(thinLineWidth, thinLineWidth);
@@ -1216,38 +1349,84 @@ public class RubberTireWheelScript : BlockScript
     }
 
     // =========================
-    // Debug 可视化：对象创建/销毁 ——不动
+    // Debug 可视化：对象创建/销毁
     // =========================
     private void EnsureDebugObjects()
     {
-        if (dbgRoot != null) return;
+        if (dbgRoot == null)
+        {
+            dbgRoot = new GameObject("RubberTire_Debug");
+            if (MainVis != null) dbgRoot.transform.SetParent(MainVis, false);
+            else dbgRoot.transform.SetParent(transform, false);
+        }
 
-        dbgRoot = new GameObject("RubberTire_Debug");
-        if (MainVis != null) dbgRoot.transform.SetParent(MainVis, false);
-        else dbgRoot.transform.SetParent(transform, false);
+        // 踏面/轴线（单份）
+        if (lrTreadAxis == null) lrTreadAxis = CreateLine(dbgRoot.transform, "L_tread_axis", Color.yellow, thinLineWidth);
 
-        lrCenterToP = CreateLine("L_center_p", Color.white, thinLineWidth);
-        lrNormal = CreateLine("L_normal", Color.green, thinLineWidth);
-        lrForceN = CreateLine("L_forceN", Color.red, forceLineWidth);
-        lrForceT = CreateLine("L_forceT", Color.blue, forceLineWidth);
-
-        lrTreadAxis = CreateLine("L_tread_axis", Color.yellow, thinLineWidth);
         int seg = Mathf.Clamp(treadRangeSegments, 8, 128);
-        lrTreadRingA = CreatePolyline("L_tread_ringA", Color.cyan, thinLineWidth, seg + 1);
-        lrTreadRingB = CreatePolyline("L_tread_ringB", Color.cyan, thinLineWidth, seg + 1);
+        if (lrTreadRingA == null) lrTreadRingA = CreatePolyline(dbgRoot.transform, "L_tread_ringA", Color.cyan, thinLineWidth, seg + 1);
+        if (lrTreadRingB == null) lrTreadRingB = CreatePolyline(dbgRoot.transform, "L_tread_ringB", Color.cyan, thinLineWidth, seg + 1);
 
-        dbgPointSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-        dbgPointSphere.name = "P_contact";
-        dbgPointSphere.transform.SetParent(dbgRoot.transform, false);
-        dbgPointSphere.transform.localScale = Vector3.one * 0.10f;
-
-        var c = dbgPointSphere.GetComponent<Collider>();
-        if (c != null) c.enabled = false;
-
-        var r = dbgPointSphere.GetComponent<Renderer>();
-        if (r != null) r.material = CreateColorMaterial(Color.yellow);
+        // 多接触点可视化池
+        EnsureDebugPointPool(Mathf.Clamp(maxContactPoints, 1, 12));
 
         HideDebugObjects();
+    }
+
+    private void EnsureDebugLocalCapacity(int desired)
+    {
+        int need = Mathf.Max(1, desired);
+        if (dbgLocalContacts == null) dbgLocalContacts = new DebugContactLocalData[Mathf.Max(8, need)];
+        if (dbgLocalContacts.Length >= need) return;
+
+        int newCap = dbgLocalContacts.Length;
+        while (newCap < need) newCap *= 2;
+        if (newCap < 8) newCap = 8;
+        var n = new DebugContactLocalData[newCap];
+        for (int i = 0; i < dbgLocalContacts.Length; i++) n[i] = dbgLocalContacts[i];
+        dbgLocalContacts = n;
+    }
+
+    private void EnsureDebugPointPool(int needed)
+    {
+        int need = Mathf.Max(0, needed);
+        if (need <= dbgPoints.Count) return;
+        if (dbgRoot == null) return;
+
+        while (dbgPoints.Count < need)
+        {
+            int idx = dbgPoints.Count;
+            dbgPoints.Add(CreateDebugPointViz(idx));
+        }
+    }
+
+    private DebugPointViz CreateDebugPointViz(int index)
+    {
+        DebugPointViz p = new DebugPointViz();
+
+        p.root = new GameObject("P_" + index);
+        p.root.transform.SetParent(dbgRoot.transform, false);
+
+        // contact point
+        p.sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        p.sphere.name = "Contact";
+        p.sphere.transform.SetParent(p.root.transform, false);
+        p.sphere.transform.localScale = Vector3.one * 0.10f;
+
+        var c = p.sphere.GetComponent<Collider>();
+        if (c != null) c.enabled = false;
+
+        var r = p.sphere.GetComponent<Renderer>();
+        if (r != null) r.material = CreateColorMaterial(Color.yellow);
+
+        // lines
+        p.lrCenterToP = CreateLine(p.root.transform, "L_center_p", Color.white, thinLineWidth);
+        p.lrNormal = CreateLine(p.root.transform, "L_normal", Color.green, thinLineWidth);
+        p.lrForceN = CreateLine(p.root.transform, "L_forceN", Color.red, forceLineWidth);
+        p.lrForceT = CreateLine(p.root.transform, "L_forceT", Color.blue, forceLineWidth);
+
+        p.root.SetActive(false);
+        return p;
     }
 
     private Material CreateColorMaterial(Color color)
@@ -1267,10 +1446,12 @@ public class RubberTireWheelScript : BlockScript
         return mat;
     }
 
-    private LineRenderer CreateLine(string name, Color color, float width)
+    private LineRenderer CreateLine(Transform parent, string name, Color color, float width)
     {
+        if (parent == null) parent = dbgRoot != null ? dbgRoot.transform : transform;
+
         var go = new GameObject(name);
-        go.transform.SetParent(dbgRoot.transform, false);
+        go.transform.SetParent(parent, false);
 
         var lr = go.AddComponent<LineRenderer>();
         lr.useWorldSpace = true;
@@ -1285,10 +1466,17 @@ public class RubberTireWheelScript : BlockScript
         return lr;
     }
 
-    private LineRenderer CreatePolyline(string name, Color color, float width, int vertexCount)
+    private LineRenderer CreateLine(string name, Color color, float width)
     {
+        return CreateLine(dbgRoot != null ? dbgRoot.transform : transform, name, color, width);
+    }
+
+    private LineRenderer CreatePolyline(Transform parent, string name, Color color, float width, int vertexCount)
+    {
+        if (parent == null) parent = dbgRoot != null ? dbgRoot.transform : transform;
+
         var go = new GameObject(name);
-        go.transform.SetParent(dbgRoot.transform, false);
+        go.transform.SetParent(parent, false);
 
         var lr = go.AddComponent<LineRenderer>();
         lr.useWorldSpace = true;
@@ -1301,6 +1489,11 @@ public class RubberTireWheelScript : BlockScript
 
         for (int i = 0; i < vc; i++) lr.SetPosition(i, Vector3.zero);
         return lr;
+    }
+
+    private LineRenderer CreatePolyline(string name, Color color, float width, int vertexCount)
+    {
+        return CreatePolyline(dbgRoot != null ? dbgRoot.transform : transform, name, color, width, vertexCount);
     }
 
     private void SetLine(LineRenderer lr, Vector3 a, Vector3 b)
@@ -1332,14 +1525,12 @@ public class RubberTireWheelScript : BlockScript
         {
             GameObject.Destroy(dbgRoot);
             dbgRoot = null;
-            lrCenterToP = null;
-            lrNormal = null;
-            lrForceN = null;
-            lrForceT = null;
             lrTreadAxis = null;
             lrTreadRingA = null;
             lrTreadRingB = null;
-            dbgPointSphere = null;
+            dbgPoints.Clear();
+            dbgHasLocal = false;
+            dbgLocalCount = 0;
         }
     }
 }
