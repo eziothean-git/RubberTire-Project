@@ -115,10 +115,10 @@ public class RubberTireWheelScript : BlockScript
 
     // =========================
     // 速度阻尼（滚动阻力 / 粘性阻尼）
-    // tau_damp = -rollingDampingK * omega
+    // Implemented via Rigidbody.angularDrag (isotropic)
     // =========================
     public bool enableRollingDamping = false;
-    public float rollingDampingK = 50f;        // N*m*s
+    public float rollingDampingK = 0.25f;      // extra Rigidbody.angularDrag (1/s)
 
     public float maxBrakeTorque = 12000f;
     public float brakeDeadbandOmega = 0.5f;
@@ -191,6 +191,13 @@ public class RubberTireWheelScript : BlockScript
     // 键盘油门/刹车状态（0~1）
     private float throttle01 = 0f;
     private float brake01 = 0f;
+
+    // Rolling damping via Rigidbody.angularDrag (store original to restore)
+    private float baseAngularDrag = 0f;
+    private bool baseAngularDragCaptured = false;
+
+    // Temp: count contact samples per attached rigidbody (for per-body weight)
+    private readonly Dictionary<int, int> tmpRbSampleCounts = new Dictionary<int, int>(16);
 
     // =========================
     // Debug 可视化（多接触点 + 插值对齐）
@@ -356,8 +363,8 @@ public class RubberTireWheelScript : BlockScript
         uiMaxDrivePower = AddSlider("Max Drive Power (W)", "pMax", maxDrivePower, 0f, 500000f);
         uiPowerOmegaEps = AddSlider("Power Omega Eps", "pEps", powerLimitOmegaEps, 0.1f, 20f);
 
-        uiRollingDamp = AddToggle("Rolling Damping", "rDmp", enableRollingDamping);
-        uiRollingDampK = AddSlider("Rolling Damping K", "rK", rollingDampingK, 0f, 5000f);
+        uiRollingDamp = AddToggle("Rolling Resistance", "rDmp", enableRollingDamping);
+        uiRollingDampK = AddSlider("Extra Angular Drag", "rK", rollingDampingK, 0f, 5f);
 
         uiMaxBrakeTorque = AddSlider("Max Brake Torque", "brkT", maxBrakeTorque, 0f, 80000f);
         uiBrakeDeadband = AddSlider("Brake Deadband (rad/s)", "brkDb", brakeDeadbandOmega, 0f, 10f);
@@ -391,7 +398,10 @@ public class RubberTireWheelScript : BlockScript
         colStates.Clear();
 
         Rigidbody.maxAngularVelocity = Mathf.Max(10f, maxAngularVelocityLimit);
-        Rigidbody.angularDrag = 0.05f;
+
+        // Capture baseline angularDrag so we can add/remove extra rolling resistance without breaking other physics.
+        baseAngularDrag = Rigidbody.angularDrag;
+        baseAngularDragCaptured = true;
 
         treadTriggerCapsule = FindTreadTriggerCapsule();
 
@@ -409,6 +419,10 @@ public class RubberTireWheelScript : BlockScript
 
         DestroyDebugObjects();
         treadTriggerCapsule = null;
+
+        // Restore baseline angular drag if we modified it.
+        if (HasRigidbody && baseAngularDragCaptured)
+            Rigidbody.angularDrag = baseAngularDrag;
     }
 
     public override void OnSimulateTriggerEnter(Collider other)
@@ -434,6 +448,9 @@ public class RubberTireWheelScript : BlockScript
 
         contactRayMask = BuildContactRayMask();
         Rigidbody.maxAngularVelocity = Mathf.Max(10f, maxAngularVelocityLimit);
+
+        // Preferred rolling resistance/damping: use angularDrag (can be toggled and restored).
+        ApplyRollingAngularDrag(contacts.Count > 0);
 
         // ===== 0) Drive/Brake (remappable keys) =====
         {
@@ -492,12 +509,6 @@ public class RubberTireWheelScript : BlockScript
                 }
             }
 
-            // ---- Rolling viscous damping (simple rolling resistance / jitter damper) ----
-            // 建议只在有接触时启用，避免空中“空气阻尼”影响你测试；需要的话你也可以改成始终启用。
-            if (enableRollingDamping && rollingDampingK > 0f && contacts.Count > 0)
-            {
-                tau += -omegaAxis * rollingDampingK;
-            }
 
             if (Mathf.Abs(tau) > 1e-6f)
                 Rigidbody.AddTorque(aAxis * tau, ForceMode.Force);
@@ -610,6 +621,20 @@ public class RubberTireWheelScript : BlockScript
             dbgDoClip = doClip;
         }
 
+        // ---- Per-rigidbody sample weighting ----
+        // 修复：不要用 1/maxContactPoints 这种常数缩放；而是按“实际命中数”分配。
+        // 规则：同一个 attachedRigidbody(或静态=0) 的所有接触点权重和为 1。
+        tmpRbSampleCounts.Clear();
+        for (int i = 0; i < topSamples.Count; i++)
+        {
+            var ss = topSamples[i];
+            int rbId = 0;
+            if (ss.col != null && ss.col.attachedRigidbody != null) rbId = ss.col.attachedRigidbody.GetInstanceID();
+            int c;
+            tmpRbSampleCounts.TryGetValue(rbId, out c);
+            tmpRbSampleCounts[rbId] = c + 1;
+        }
+
         for (int i = 0; i < topSamples.Count; i++)
         {
             var s = topSamples[i];
@@ -634,6 +659,14 @@ public class RubberTireWheelScript : BlockScript
 
             if (gate <= 1e-4f) continue;
 
+            // per-rigidbody weight (sum=1 per rigidbody / static body)
+            int rbId = 0;
+            if (s.col != null && s.col.attachedRigidbody != null) rbId = s.col.attachedRigidbody.GetInstanceID();
+            int rbCount = 1;
+            tmpRbSampleCounts.TryGetValue(rbId, out rbCount);
+            if (rbCount <= 0) rbCount = 1;
+            float sampleWeight = 1f / (float)rbCount;
+
             // ---- Normal force ----
             float Fn = springK * s.pen;
 
@@ -647,6 +680,7 @@ public class RubberTireWheelScript : BlockScript
 
             Fn = Mathf.Clamp(Fn, 0f, maxNormalForce);
             Fn *= gate;
+            Fn *= sampleWeight;
             if (Fn <= 1e-6f) continue;
 
             Vector3 FnVec = Fn * nUse;
@@ -742,6 +776,7 @@ public class RubberTireWheelScript : BlockScript
 
                     // gate 同样乘到切向（即使 Fn 已 gate，乘一次不会错，只会更“渐变”）
                     Ftire *= gate;
+                    Ftire *= sampleWeight;
 
                     if (Ftire.sqrMagnitude > 1e-10f)
                     {
@@ -905,7 +940,30 @@ public class RubberTireWheelScript : BlockScript
         ApplyLineWidthsIfReady();
     }
 
+    
     // =========================
+    // Rolling damping (preferred): use Rigidbody.angularDrag instead of manual torque
+    // =========================
+    private void ApplyRollingAngularDrag(bool hasContact)
+    {
+        if (!HasRigidbody) return;
+
+        if (!baseAngularDragCaptured)
+        {
+            baseAngularDrag = Rigidbody.angularDrag;
+            baseAngularDragCaptured = true;
+        }
+
+        float target = baseAngularDrag;
+        if (enableRollingDamping && rollingDampingK > 0f && hasContact)
+            target = baseAngularDrag + rollingDampingK;
+
+        // Only set when changed to reduce churn
+        if (Mathf.Abs(Rigidbody.angularDrag - target) > 1e-6f)
+            Rigidbody.angularDrag = target;
+    }
+
+// =========================
     // Contact gather (per collider aggregation)
     // =========================
     private void GatherTopContactSamples(
