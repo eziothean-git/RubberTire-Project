@@ -8,7 +8,7 @@
 	<Name>橡胶轮胎</Name>
 	
 	<!-- TODO: Change the mass to something appropriate -->
-	<Mass>0.5</Mass>
+	<Mass>1.0</Mass>
 
 	<Mesh name="WheelMesh"> <!-- Must be defined as a resource in the manifest. -->
 		<Position x="0.0" y="0.0" z="0.5" />
@@ -118,6 +118,13 @@
                         min="0.01" max="0.30" default="0.10" unclamped="true" />
                 <Slider displayName="Force Scale" key="fs"
                         min="0.00001" max="0.01" default="0.0015" unclamped="true" />
+
+				<ToggleMapper id="pLim" defaultValue="true" />
+				<SliderMapper id="pMax" min="0" max="500000" defaultValue="120000" notice="Max Drive Power (W)" />
+				<SliderMapper id="pEps" min="0.1" max="20" defaultValue="1" notice="Power Omega Eps" />
+
+				<ToggleMapper id="rDmp" defaultValue="false" />
+				<SliderMapper id="rK" min="0" max="5000" defaultValue="50" notice="Rolling Damping K" />
         </MapperTypes>
         
 	<Script>RubberTireWheelScript</Script>

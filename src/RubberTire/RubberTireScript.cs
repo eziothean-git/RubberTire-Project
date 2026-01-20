@@ -103,6 +103,23 @@ public class RubberTireWheelScript : BlockScript
     public bool enableDriveBrake = true;
     public bool invertDriveTorque = false;
     public float maxDriveTorque = 8000f;
+
+    // =========================
+    // 恒功率约束（Drive torque cap by power）
+    // |tau_drive * omega| <= maxDrivePower
+    // 说明：只限制“驱动扭矩”（throttle 部分），刹车扭矩不受该限制。
+    // =========================
+    public bool enablePowerLimit = true;
+    public float maxDrivePower = 120000f;      // W
+    public float powerLimitOmegaEps = 1.0f;    // rad/s，避免低速除零
+
+    // =========================
+    // 速度阻尼（滚动阻力 / 粘性阻尼）
+    // tau_damp = -rollingDampingK * omega
+    // =========================
+    public bool enableRollingDamping = false;
+    public float rollingDampingK = 50f;        // N*m*s
+
     public float maxBrakeTorque = 12000f;
     public float brakeDeadbandOmega = 0.5f;
     public float brakeHoldK = 2000f;
@@ -146,6 +163,10 @@ public class RubberTireWheelScript : BlockScript
     private MToggle uiInvertDrive;
     private MKey uiKeyThrottle, uiKeyBrake, uiKeyReverse;
     private MSlider uiMaxDriveTorque, uiMaxBrakeTorque, uiBrakeDeadband, uiBrakeHoldK;
+    private MToggle uiPowerLimit;
+    private MSlider uiMaxDrivePower, uiPowerOmegaEps;
+    private MToggle uiRollingDamp;
+    private MSlider uiRollingDampK;
     private MSlider uiThrottleRise, uiThrottleFall, uiBrakeRise, uiBrakeFall;
 
     private MSlider uiMaxAngVel;
@@ -199,9 +220,11 @@ public class RubberTireWheelScript : BlockScript
     {
         public bool active;
         public Vector3 pLocal;
-        public Vector3 nLocal;
+        // 方向量保留为 world（不要用插值后的 Rigidbody.rotation 去还原方向），
+        // 否则轮子自转时 rotation 插值包含 spin，会把“本应指向世界向上/沿地面”的向量也一起转走。
+        public Vector3 nWorld;
         public float FnMag;
-        public Vector3 FtLocal;
+        public Vector3 FtWorld;
         public float FtMag;
     }
 
@@ -329,6 +352,13 @@ public class RubberTireWheelScript : BlockScript
         uiKeyReverse = AddKey("Reverse Key", "kRev", KeyCode.R);
 
         uiMaxDriveTorque = AddSlider("Max Drive Torque", "drvT", maxDriveTorque, 0f, 50000f);
+        uiPowerLimit = AddToggle("Power Limit", "pLim", enablePowerLimit);
+        uiMaxDrivePower = AddSlider("Max Drive Power (W)", "pMax", maxDrivePower, 0f, 500000f);
+        uiPowerOmegaEps = AddSlider("Power Omega Eps", "pEps", powerLimitOmegaEps, 0.1f, 20f);
+
+        uiRollingDamp = AddToggle("Rolling Damping", "rDmp", enableRollingDamping);
+        uiRollingDampK = AddSlider("Rolling Damping K", "rK", rollingDampingK, 0f, 5000f);
+
         uiMaxBrakeTorque = AddSlider("Max Brake Torque", "brkT", maxBrakeTorque, 0f, 80000f);
         uiBrakeDeadband = AddSlider("Brake Deadband (rad/s)", "brkDb", brakeDeadbandOmega, 0f, 10f);
         uiBrakeHoldK = AddSlider("Brake Hold K", "brkK", brakeHoldK, 0f, 20000f);
@@ -431,7 +461,22 @@ public class RubberTireWheelScript : BlockScript
             float revSign = heldRev ? -1f : 1f;
             float driveSign = flipSign * userSign * revSign;
 
-            float tau = tauDrive * driveSign;
+            // ---- Drive torque (throttle) ----
+            float tauDriveCmd = tauDrive * driveSign;
+
+            // 恒功率约束：|tau_drive * omega| <= maxDrivePower
+            if (enablePowerLimit && maxDrivePower > 0f)
+            {
+                float absOmega = Mathf.Abs(omegaAxis);
+                if (absOmega > Mathf.Max(1e-4f, powerLimitOmegaEps))
+                {
+                    float tauMaxByPower = maxDrivePower / absOmega;
+                    float tauMax = Mathf.Min(Mathf.Abs(maxDriveTorque), tauMaxByPower);
+                    tauDriveCmd = Mathf.Clamp(tauDriveCmd, -tauMax, tauMax);
+                }
+            }
+
+            float tau = tauDriveCmd;
 
             if (brake01 > 1e-4f)
             {
@@ -445,6 +490,13 @@ public class RubberTireWheelScript : BlockScript
                     float tauHold = -omegaAxis * brakeHoldK;
                     tau += Mathf.Clamp(tauHold, -tauBMax, tauBMax);
                 }
+            }
+
+            // ---- Rolling viscous damping (simple rolling resistance / jitter damper) ----
+            // 建议只在有接触时启用，避免空中“空气阻尼”影响你测试；需要的话你也可以改成始终启用。
+            if (enableRollingDamping && rollingDampingK > 0f && contacts.Count > 0)
+            {
+                tau += -omegaAxis * rollingDampingK;
             }
 
             if (Mathf.Abs(tau) > 1e-6f)
@@ -705,9 +757,9 @@ public class RubberTireWheelScript : BlockScript
                 DebugContactLocalData d;
                 d.active = true;
                 d.pLocal = rbInvRot * (s.p - rbPos);
-                d.nLocal = rbInvRot * nUse;
+                d.nWorld = nUse;
                 d.FnMag = Fn;
-                d.FtLocal = rbInvRot * Ftire;
+                d.FtWorld = Ftire;
                 d.FtMag = Ftire.magnitude;
                 dbgLocalContacts[dbgLocalCount] = d;
                 dbgLocalCount++;
@@ -781,7 +833,7 @@ public class RubberTireWheelScript : BlockScript
             DebugContactLocalData d = dbgLocalContacts[i];
 
             Vector3 p = rbPos + rbRot * d.pLocal;
-            Vector3 n = rbRot * d.nLocal;
+            Vector3 n = d.nWorld;
             if (n.sqrMagnitude > 1e-12f) n.Normalize();
             else n = Vector3.up;
 
@@ -814,7 +866,7 @@ public class RubberTireWheelScript : BlockScript
             {
                 if (showForceViz && d.FtMag > 1e-6f)
                 {
-                    Vector3 ftW = rbRot * d.FtLocal;
+                    Vector3 ftW = d.FtWorld;
                     float m = ftW.magnitude;
                     if (m > 1e-6f)
                     {
@@ -1168,6 +1220,12 @@ public class RubberTireWheelScript : BlockScript
         if (uiDriveBrake != null) enableDriveBrake = uiDriveBrake.IsActive;
         if (uiInvertDrive != null) invertDriveTorque = uiInvertDrive.IsActive;
         if (uiMaxDriveTorque != null) maxDriveTorque = uiMaxDriveTorque.Value;
+        if (uiPowerLimit != null) enablePowerLimit = uiPowerLimit.IsActive;
+        if (uiMaxDrivePower != null) maxDrivePower = uiMaxDrivePower.Value;
+        if (uiPowerOmegaEps != null) powerLimitOmegaEps = uiPowerOmegaEps.Value;
+
+        if (uiRollingDamp != null) enableRollingDamping = uiRollingDamp.IsActive;
+        if (uiRollingDampK != null) rollingDampingK = uiRollingDampK.Value;
         if (uiMaxBrakeTorque != null) maxBrakeTorque = uiMaxBrakeTorque.Value;
         if (uiBrakeDeadband != null) brakeDeadbandOmega = uiBrakeDeadband.Value;
         if (uiBrakeHoldK != null) brakeHoldK = uiBrakeHoldK.Value;
