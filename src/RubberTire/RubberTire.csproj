@@ -49,6 +49,9 @@
     <Compile Include="Mod.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="RubberTireWheelScript.Drivetrain.cs" />
+    <Compile Include="RubberTireWheelScript.FactorySettings.cs" />
+    <Compile Include="RubberTireConfigMapper.cs" />
+    <Compile Include="RubberTireFactoryUI.cs" />
     <Compile Include="RubberTireWheelScript.Lateral.cs" />
     <Compile Include="RubberTireWheelScript.Support.cs" />
     <Compile Include="RubberTireScript.cs" />
@@ -60,5 +63,21 @@
   <PropertyGroup>
   <PlatformTarget>x86</PlatformTarget>
   <Prefer32Bit>true</Prefer32Bit>
+  <UIFACTORY_ASSEMBLIES Condition=" '$(UIFACTORY_ASSEMBLIES)' == '' And Exists('$(HOME)/.local/share/Steam/steamapps/workshop/content/346010/2913469777/UIFactory/Besiege.UI.dll') ">$(HOME)/.local/share/Steam/steamapps/workshop/content/346010/2913469777/UIFactory/</UIFACTORY_ASSEMBLIES>
+  <UIFACTORY_ASSEMBLIES Condition=" '$(UIFACTORY_ASSEMBLIES)' == '' ">$(BESIEGE_GAME_ASSEMBLIES)..\..\..\..\workshop\content\346010\2913469777\UIFactory\</UIFACTORY_ASSEMBLIES>
 </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Besiege.UI">
+      <HintPath>$(UIFACTORY_ASSEMBLIES)Besiege.UI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Besiege.UI.Bridge">
+      <HintPath>$(UIFACTORY_ASSEMBLIES)Besiege.UI.Bridge.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(BESIEGE_UNITY_ASSEMBLIES)UnityEngine.UI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
 </Project>

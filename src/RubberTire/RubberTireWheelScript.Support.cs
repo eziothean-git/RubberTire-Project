@@ -10,41 +10,14 @@ public partial class RubberTireWheelScript
     public bool enableStableNormalSupport = true;
     public float normalSupportERP = 0.35f;
     public float normalSupportVelDamping = 1.0f;
-    public float normalSupportMassScale = 4.0f;
     public float normalSupportSlop = 0.005f;
     public bool enableNormalGroundReactionForces = false;
 
-    private MSlider uiK, uiC;
-    private MToggle uiStableNormal, uiNormalGroundReaction;
-    private MSlider uiNormalERP, uiNormalVelDamping, uiNormalMassScale, uiNormalSlop;
-
-    private void CreateSupportMapperControls()
-    {
-        uiK = AddSlider("K (Spring)", "k", springK, 0f, 200000f);
-        uiC = AddSlider("C (Damper)", "c", damperC, 0f, 5000f);
-        uiStableNormal = AddToggle("Stable Normal Support", "nStable", enableStableNormalSupport);
-        uiNormalERP = AddSlider("Normal ERP", "nErp", normalSupportERP, 0f, 1f);
-        uiNormalVelDamping = AddSlider("Normal Vel Damping", "nDamp", normalSupportVelDamping, 0f, 2f);
-        uiNormalMassScale = AddSlider("Normal Mass Scale", "nMass", normalSupportMassScale, 0.25f, 20f);
-        uiNormalSlop = AddSlider("Normal Slop", "nSlop", normalSupportSlop, 0f, 0.05f);
-    }
-
-    private void CreateSupportReactionMapperControl()
-    {
-        uiNormalGroundReaction = AddToggle("ADV: Normal Reaction", "advNReact", enableNormalGroundReactionForces);
-    }
-
-    private void SyncSupportParamsFromUI()
-    {
-        if (uiK != null) springK = uiK.Value;
-        if (uiC != null) damperC = uiC.Value;
-        if (uiStableNormal != null) enableStableNormalSupport = uiStableNormal.IsActive;
-        if (uiNormalERP != null) normalSupportERP = uiNormalERP.Value;
-        if (uiNormalVelDamping != null) normalSupportVelDamping = uiNormalVelDamping.Value;
-        if (uiNormalMassScale != null) normalSupportMassScale = uiNormalMassScale.Value;
-        if (uiNormalSlop != null) normalSupportSlop = uiNormalSlop.Value;
-        if (uiNormalGroundReaction != null) enableNormalGroundReactionForces = uiNormalGroundReaction.IsActive;
-    }
+    // Solver policy, deliberately fixed rather than exposed as tyre identity parameters.
+    // Recovery is limited in velocity space, so a light wheel cannot receive the same
+    // huge force as a heavy wheel and leave the patch faster than the requested speed.
+    private const float NormalRecoveryTime = 0.10f;
+    private const float NormalMaxRecoverySpeed = 1.25f;
 
     private float EvaluateAndApplySupportForce(
         ContactSample sample,
@@ -61,53 +34,51 @@ public partial class RubberTireWheelScript
             wheelVelocity - groundVelocity,
             contactNormal);
 
-        float rawForce = springK * sample.pen;
-        if (damperC > 0f)
+        float dt = Mathf.Max(1e-5f, Time.fixedDeltaTime);
+        float penetration = Mathf.Max(0f, sample.pen - Mathf.Max(0f, normalSupportSlop));
+
+        // A pneumatic tyre resists motion in both directions while compressed.
+        // Rebound damping subtracts support instead of allowing the spring to launch
+        // the wheel with no opposing term.
+        float desiredForce = Mathf.Max(0f, springK) * penetration
+                           - Mathf.Max(0f, damperC) * relativeNormalVelocity;
+        desiredForce = Mathf.Clamp(desiredForce, 0f, Mathf.Max(0f, maxNormalForce));
+        float desiredImpulse = desiredForce * dt;
+
+        if (enableStableNormalSupport)
         {
-            float compressionSpeed = -relativeNormalVelocity;
-            if (compressionSpeed > 0f) rawForce += damperC * compressionSpeed;
+            float effectiveMass = GetEffectiveNormalMass(
+                sample.p,
+                contactNormal,
+                enableNormalGroundReactionForces ? groundBody : null);
+            float recoverySpeed = penetration
+                                * Mathf.Clamp01(normalSupportERP)
+                                / NormalRecoveryTime;
+            recoverySpeed = Mathf.Min(recoverySpeed, NormalMaxRecoverySpeed);
+
+            // Stopping compression is dissipative. It can raise an under-tuned spring
+            // up to the impulse needed to cancel a fraction of incoming velocity.
+            float stopCompressionImpulse = effectiveMass
+                * Mathf.Max(0f, -relativeNormalVelocity)
+                * Mathf.Clamp01(normalSupportVelDamping);
+            desiredImpulse = Mathf.Max(desiredImpulse, stopCompressionImpulse);
+
+            // Hard energy guard: after this support impulse alone, separation speed
+            // cannot exceed the soft recovery target. This removes the old 1/dt^2,
+            // mass-scale over-correction that made light wheels pogo.
+            float maximumSafeImpulse = effectiveMass
+                * Mathf.Max(0f, recoverySpeed - relativeNormalVelocity);
+            desiredImpulse = Mathf.Min(desiredImpulse, maximumSafeImpulse);
         }
 
-        float stableForce = BuildStableNormalSupportForce(
-            sample.pen,
-            relativeNormalVelocity,
-            sample.p,
-            contactNormal,
-            groundBody);
-        if (stableForce > rawForce) rawForce = stableForce;
-        rawForce = Mathf.Clamp(rawForce, 0f, maxNormalForce);
+        float appliedImpulse = desiredImpulse * Mathf.Clamp01(gate) * Mathf.Max(0f, sampleWeight);
+        if (appliedImpulse <= 1e-8f) return 0f;
 
-        float normalLoad = rawForce * gate * sampleWeight;
-        if (normalLoad <= 1e-6f) return 0f;
-
-        Vector3 force = normalLoad * contactNormal;
-        Rigidbody.AddForceAtPosition(force, sample.p, ForceMode.Force);
+        Vector3 impulse = appliedImpulse * contactNormal;
+        Rigidbody.AddForceAtPosition(impulse, sample.p, ForceMode.Impulse);
         if (enableNormalGroundReactionForces && groundBody != null)
-            groundBody.AddForceAtPosition(-force, sample.p, ForceMode.Force);
-        return normalLoad;
-    }
-
-    private float BuildStableNormalSupportForce(
-        float penetration,
-        float relativeNormalVelocity,
-        Vector3 point,
-        Vector3 normal,
-        Rigidbody groundRb)
-    {
-        if (!enableStableNormalSupport) return 0f;
-        if (!HasRigidbody) return 0f;
-        if (normal.sqrMagnitude < 1e-10f) return 0f;
-
-        float dt = Mathf.Max(1e-5f, Time.fixedDeltaTime);
-        float pen = Mathf.Max(0f, penetration - Mathf.Max(0f, normalSupportSlop));
-
-        float targetVN = pen * Mathf.Clamp01(normalSupportERP) / dt;
-        float dv = targetVN - relativeNormalVelocity * Mathf.Max(0f, normalSupportVelDamping);
-        if (dv <= 1e-5f) return 0f;
-
-        float effectiveMass = GetEffectiveNormalMass(point, normal, groundRb);
-        effectiveMass *= Mathf.Max(0.01f, normalSupportMassScale);
-        return effectiveMass * dv / dt;
+            groundBody.AddForceAtPosition(-impulse, sample.p, ForceMode.Impulse);
+        return appliedImpulse / dt;
     }
 
     private float GetEffectiveNormalMass(Vector3 point, Vector3 normal, Rigidbody groundRb)

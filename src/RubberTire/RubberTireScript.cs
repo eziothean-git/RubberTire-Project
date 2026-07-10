@@ -9,7 +9,7 @@ using Modding;
 /// - 接触强度 gate：fade-in/out (按物理帧渐入/渐出) 抑制“忽有忽无”的能量注入
 /// - 法向一阶滤波：对聚合法向做 Slerp 低通，alpha 可调（建议较小）
 /// - Raycast 方向：固定使用“轮子径向朝地面”（gravity 投影到垂直轮轴平面）
-/// - LayerMask：24/29 必选，0 可选
+/// - Contact ray：查询所有 layer，射线命中本身就是接触候选
 /// - 可视化暂不改
 /// </summary>
 public partial class RubberTireWheelScript : BlockScript
@@ -28,12 +28,9 @@ public partial class RubberTireWheelScript : BlockScript
 
     public bool enableTreadRayFan = false; // true: cast multiple rays across finite tread width
     public int treadRayCount = 3;
-    // Dev: layer mask performance
-    public bool includeLayer0 = false;
 
     // ====== Multi-point settings ======
     public int maxContactPoints = 6;          // Top-N colliders by penetration after aggregation
-    public float contactKeyQuantize = 0.02f;  // m，命中点 local 量化网格（用于 per-point 状态 key）
     public int contactStateTTLSteps = 30;     // 固定步数未见就淘汰状态（避免字典无限长）
 
     // ====== per-collider aggregation settings ======
@@ -80,27 +77,6 @@ public partial class RubberTireWheelScript : BlockScript
     public int drawEveryFixedSteps = 1;
     public int treadRangeSegments = 28;
     public float treadAxisDebugLen = 2.0f;
-
-    // =========================
-    // UI（Mapper）句柄
-    // =========================
-    private MSlider uiLineW, uiForceScale, uiTreadW;
-    private MToggle uiDbg, uiTreadClip;
-    private MToggle uiDbgForce, uiDbgTreadAxis;
-
-    private MSlider uiMaxAngVel;
-
-    private MToggle uiIncludeLayer0;
-
-    private MSlider uiMaxContactPoints;
-    private MToggle uiTreadRayFan;
-    private MSlider uiTreadRayCount;
-
-    // NEW UI
-    private MToggle uiGateEnable;
-    private MSlider uiGateInFrames, uiGateOutFrames;
-    private MToggle uiNFilterEnable;
-    private MSlider uiNFilterAlpha;
 
     // =========================
     // 运行时状态
@@ -165,29 +141,6 @@ public partial class RubberTireWheelScript : BlockScript
     private int contactRayMask = ~0;
 
     // ====== per-point tire state cache ======
-    private struct ContactKey
-    {
-        public int colliderId;
-        public Vector3 localQ; // quantized local point
-        public override int GetHashCode()
-        {
-            unchecked
-            {
-                int h = colliderId;
-                h = h * 31 + localQ.x.GetHashCode();
-                h = h * 31 + localQ.y.GetHashCode();
-                h = h * 31 + localQ.z.GetHashCode();
-                return h;
-            }
-        }
-        public override bool Equals(object obj)
-        {
-            if (!(obj is ContactKey)) return false;
-            var o = (ContactKey)obj;
-            return colliderId == o.colliderId && localQ == o.localQ;
-        }
-    }
-
     // ====== NEW: per-collider contact gate + normal filter state ======
     private class ColliderContactState
     {
@@ -229,37 +182,8 @@ public partial class RubberTireWheelScript : BlockScript
 
     public override void SafeAwake()
     {
-        CreateSupportMapperControls();
-        CreateLateralMapperControls();
-        CreateSupportReactionMapperControl();
-
-        uiDbg = AddToggle("Debug Master", "dbg", debugDraw);
-        uiDbgForce = AddToggle("DebugViz: Tire Force", "dbgF", debugVizTireForce);
-        uiDbgTreadAxis = AddToggle("Debug: Tread+Axis", "dbgTA", debugVizTreadAndAxis);
-
-        uiTreadClip = AddToggle("Tread Width Clip", "tw-clip", enableTreadWidthClip);
-        uiTreadW = AddSlider("Tread Width", "tw", treadWidth, 0.05f, 5f);
-        uiTreadRayFan = AddToggle("ADV: Tread Ray Fan", "advRay", enableTreadRayFan);
-        uiTreadRayCount = AddSlider("ADV: Tread Ray Count", "rayN", treadRayCount, 1f, 7f);
-
-        uiLineW = AddSlider("Line Width", "lw", forceLineWidth, 0.01f, 0.30f);
-        uiForceScale = AddSlider("Force Scale", "fs", forceToLength, 0.00001f, 0.01f);
-
-        CreateDrivetrainMapperControls();
-
-        uiMaxAngVel = AddSlider("Max Angular Vel (rad/s)", "maxW", maxAngularVelocityLimit, 10f, 1000f);
-
-        uiIncludeLayer0 = AddToggle("Contact Ray: Include Layer 0", "ly0", includeLayer0);
-
-        uiMaxContactPoints = AddSlider("Max Contact Points", "cpN", maxContactPoints, 1f, 6f);
-
-        // NEW: gate + normal filter tuning UI
-        uiGateEnable = AddToggle("Contact Gate", "gate", enableContactGate);
-        uiGateInFrames = AddSlider("Gate FadeIn (frames)", "gIn", gateFadeInFrames, 1f, 20f);
-        uiGateOutFrames = AddSlider("Gate FadeOut (frames)", "gOut", gateFadeOutFrames, 1f, 20f);
-
-        uiNFilterEnable = AddToggle("Normal Filter", "nF", enableNormalFilter);
-        uiNFilterAlpha = AddSlider("Normal Filter Alpha", "nFa", normalFilterAlpha, 0.01f, 1.0f);
+        CreateDrivetrainKeyControls();
+        CreateFactoryConfigMapper();
     }
 
     public override void OnSimulateStart()
@@ -267,6 +191,8 @@ public partial class RubberTireWheelScript : BlockScript
         contacts.Clear();
         fixedStepCounter = 0;
         currentGear = 1;
+        throttle01 = 0f;
+        brake01 = 0f;
 
         pointStates.Clear();
         colStates.Clear();
@@ -290,6 +216,8 @@ public partial class RubberTireWheelScript : BlockScript
         contacts.Clear();
         pointStates.Clear();
         colStates.Clear();
+        throttle01 = 0f;
+        brake01 = 0f;
 
         DestroyDebugObjects();
         treadTriggerCapsule = null;
@@ -302,7 +230,6 @@ public partial class RubberTireWheelScript : BlockScript
     public override void OnSimulateTriggerEnter(Collider other)
     {
         if (other == null) return;
-        if (!IsColliderInContactLayers(other)) return;
         contacts.Add(other);
     }
 
@@ -318,8 +245,7 @@ public partial class RubberTireWheelScript : BlockScript
 
         if (!IsSimulating || !HasRigidbody) return;
 
-        SyncParamsFromUI();
-
+        FactoryPullSettings();
         contactRayMask = BuildContactRayMask();
         Rigidbody.maxAngularVelocity = Mathf.Max(10f, maxAngularVelocityLimit);
 
@@ -328,16 +254,7 @@ public partial class RubberTireWheelScript : BlockScript
 
         // ===== 0) Drive/Brake (remappable keys) =====
         ApplyDriveBrake();
-
-        if (contacts.Count == 0)
-        {
-            ApplyAxleSpinStabilization(0f, 0f, GetDriveAxisWorld());
-            if (resetShearOnNoContact) pointStates.Clear();
-            // gate 状态也要衰减/清理（避免突然恢复时跳变）
-            DecayAndCleanupColliderStates();
-            HideDebugObjects();
-            return;
-        }
+        MarkAllColliderStatesUnseen();
 
         // ===== 轮心/半径（世界）=====
         Vector3 center;
@@ -399,16 +316,17 @@ public partial class RubberTireWheelScript : BlockScript
         // ===== 1) Gather aggregated contact samples, then take Top-N colliders =====
         int N = Mathf.Clamp(maxContactPoints, 1, 6);
         GatherTopContactSamples(center, downDir, R, doClip, axisWorld, halfW, N, topSamples);
-
-        // 标记所有状态“本帧未见”
-        MarkAllColliderStatesUnseen();
+        ResetLateralPatchAccumulators();
 
         if (topSamples.Count == 0)
         {
             // 没命中：全部衰减
+            ApplyAxleSpinStabilization(0f, 0f, GetDriveAxisWorld());
+            if (resetShearOnNoContact) pointStates.Clear();
             DecayAndCleanupColliderStates();
             dbgHasLocal = false;
             CleanupPointStates();
+            HideDebugObjects();
             return;
         }
 
@@ -494,9 +412,12 @@ public partial class RubberTireWheelScript : BlockScript
             totalNormalLoadForAxle += Fn;
 
             ApplyLoadSensitiveRollingResistance(Fn, R, aAxisWheel);
-
-            Vector3 Ftire = EvaluateAndApplyTireForce(
-                s, nUse, groundRb, aAxisWheel, Fn, gate, sampleWeight, dtFixed);
+            int lateralPatchIndex = AccumulateLateralPatch(
+                s,
+                nUse,
+                groundRb,
+                Fn,
+                gate * sampleWeight);
 
             // ---- Debug 采样（每个接触点分别画 Fn / Ft / normal / contact point）----
             if (doDbgSample && dbgLocalCount < dbgLocalContacts.Length)
@@ -506,13 +427,16 @@ public partial class RubberTireWheelScript : BlockScript
                 d.pLocal = rbInvRot * (s.p - rbPos);
                 d.nWorld = nUse;
                 d.FnMag = Fn;
-                d.FtWorld = Ftire;
-                d.FtMag = Ftire.magnitude;
+                d.FtWorld = Vector3.zero;
+                d.FtMag = 0f;
                 dbgLocalContacts[dbgLocalCount] = d;
+                AttachLateralPatchDebugIndex(lateralPatchIndex, dbgLocalCount);
                 dbgLocalCount++;
             }
 
         }
+
+        ApplyAccumulatedLateralPatches(aAxisWheel, dtFixed, doDbgSample);
 
         ApplyAxleSpinStabilization(totalNormalLoadForAxle, R, aAxisWheel);
 
@@ -730,8 +654,7 @@ public partial class RubberTireWheelScript : BlockScript
                 Collider c = hit.collider;
                 if (c == null) continue;
 
-                if (!contacts.Contains(c)) continue;
-                if (!IsColliderInContactLayers(c)) continue;
+                if (c.attachedRigidbody == Rigidbody) continue;
 
                 Vector3 p = hit.point;
                 Vector3 n = hit.normal;
@@ -933,35 +856,46 @@ public partial class RubberTireWheelScript : BlockScript
     }
 
     // =========================
-    // Per-point state helpers
+    // Per lateral-patch state helpers
     // =========================
-    private TirePointState GetOrCreatePointState(Collider col, Vector3 worldPoint)
+    private TirePointState GetOrCreatePatchState(
+        int patchKey,
+        Vector3 worldPoint,
+        Vector3 worldNormal)
     {
-        ContactKey k = MakeContactKey(col, worldPoint);
         TirePointState st;
-        if (!pointStates.TryGetValue(k, out st))
+        if (!pointStates.TryGetValue(patchKey, out st))
         {
             st = new TirePointState();
-            st.lastSeenStep = fixedStepCounter;
-            pointStates.Add(k, st);
+            pointStates.Add(patchKey, st);
         }
+
+        bool reset = false;
+        if (st.lastSeenStep > 0)
+        {
+            if ((worldPoint - st.lastPointWorld).sqrMagnitude
+                > StaticStateMaxPointJump * StaticStateMaxPointJump)
+                reset = true;
+            if (Vector3.Dot(st.lastNormalWorld, worldNormal)
+                < StaticStateMinNormalDot)
+                reset = true;
+        }
+
+        if (reset)
+        {
+            st.shearDispWorld = Vector3.zero;
+            st.FtireFiltered = Vector3.zero;
+            ResetStaticConstraintHistory(st);
+        }
+
+        if (st.lastSeenStep > 0
+            && fixedStepCounter - st.lastSeenStep > 1)
+            ResetStaticConstraintHistory(st);
+
+        st.lastPointWorld = worldPoint;
+        st.lastNormalWorld = worldNormal;
+        st.lastSeenStep = fixedStepCounter;
         return st;
-    }
-
-    private ContactKey MakeContactKey(Collider col, Vector3 worldPoint)
-    {
-        int id = (col != null) ? col.GetInstanceID() : 0;
-        Vector3 lp = (col != null) ? col.transform.InverseTransformPoint(worldPoint) : worldPoint;
-
-        float q = Mathf.Max(1e-4f, contactKeyQuantize);
-        lp.x = Mathf.Round(lp.x / q) * q;
-        lp.y = Mathf.Round(lp.y / q) * q;
-        lp.z = Mathf.Round(lp.z / q) * q;
-
-        ContactKey k;
-        k.colliderId = id;
-        k.localQ = lp;
-        return k;
     }
 
     private void CleanupPointStates()
@@ -972,7 +906,7 @@ public partial class RubberTireWheelScript : BlockScript
         int threshold = fixedStepCounter - ttl;
 
         pointStatesToRemove.Clear();
-        foreach (var kv in pointStates)
+        foreach (KeyValuePair<int, TirePointState> kv in pointStates)
         {
             if (kv.Value == null) { pointStatesToRemove.Add(kv.Key); continue; }
             if (kv.Value.lastSeenStep < threshold) pointStatesToRemove.Add(kv.Key);
@@ -980,49 +914,6 @@ public partial class RubberTireWheelScript : BlockScript
 
         for (int i = 0; i < pointStatesToRemove.Count; i++)
             pointStates.Remove(pointStatesToRemove[i]);
-    }
-
-    // =========================
-    // UI 同步
-    // =========================
-    private void SyncParamsFromUI()
-    {
-        SyncSupportParamsFromUI();
-        SyncLateralParamsFromUI();
-
-        if (uiDbg != null) debugDraw = uiDbg.IsActive;
-        if (uiDbgForce != null) debugVizTireForce = uiDbgForce.IsActive;
-        if (uiDbgTreadAxis != null) debugVizTreadAndAxis = uiDbgTreadAxis.IsActive;
-
-        if (uiTreadClip != null) enableTreadWidthClip = uiTreadClip.IsActive;
-        if (uiTreadW != null) treadWidth = uiTreadW.Value;
-        if (uiTreadRayFan != null) enableTreadRayFan = uiTreadRayFan.IsActive;
-        if (uiTreadRayCount != null) treadRayCount = Mathf.RoundToInt(uiTreadRayCount.Value);
-
-        if (uiLineW != null)
-        {
-            float w = uiLineW.Value;
-            forceLineWidth = w;
-            thinLineWidth = w * 0.6f;
-        }
-
-        if (uiForceScale != null) forceToLength = uiForceScale.Value;
-
-        SyncDrivetrainParamsFromUI();
-
-        if (uiMaxAngVel != null) maxAngularVelocityLimit = uiMaxAngVel.Value;
-
-        if (uiIncludeLayer0 != null) includeLayer0 = uiIncludeLayer0.IsActive;
-
-        if (uiMaxContactPoints != null) maxContactPoints = Mathf.RoundToInt(uiMaxContactPoints.Value);
-
-        // NEW: gate + normal filter UI
-        if (uiGateEnable != null) enableContactGate = uiGateEnable.IsActive;
-        if (uiGateInFrames != null) gateFadeInFrames = Mathf.RoundToInt(uiGateInFrames.Value);
-        if (uiGateOutFrames != null) gateFadeOutFrames = Mathf.RoundToInt(uiGateOutFrames.Value);
-
-        if (uiNFilterEnable != null) enableNormalFilter = uiNFilterEnable.IsActive;
-        if (uiNFilterAlpha != null) normalFilterAlpha = uiNFilterAlpha.Value;
     }
 
     private void ApplyLineWidthsIfReady()
@@ -1042,22 +933,11 @@ public partial class RubberTireWheelScript : BlockScript
     }
 
     // =========================
-    // Layer mask helpers
+    // Contact query mask
     // =========================
     private int BuildContactRayMask()
     {
-        int mask = (1 << 24) | (1 << 29);
-        if (includeLayer0) mask |= (1 << 0);
-        return mask;
-    }
-
-    private bool IsColliderInContactLayers(Collider c)
-    {
-        if (c == null) return false;
-        int lay = c.gameObject.layer;
-        int bit = 1 << lay;
-        int mask = BuildContactRayMask();
-        return (bit & mask) != 0;
+        return ~0;
     }
 
     // =========================

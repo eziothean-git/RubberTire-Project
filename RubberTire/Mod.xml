@@ -9,10 +9,11 @@
 	<Name>RubberTire</Name>
 	<Author>Eziothean</Author> <!-- FIX: Insert your name here. -->
 	<!-- Major.Minor.Build -->
-	<Version>0.0.1</Version>
+	<Version>0.3.0</Version>
 	
 	<Description>
-A newly created mod. <!-- FIX: Insert a short description here. -->
+Physical tyre, support and drivetrain replacement for Besiege wheels.
+Requires UIFactory 3 for the tuning workspace and live curve graphs.
 	</Description>
 	
 	<!-- Square icon of the mod. Texture defined in the Resources section.

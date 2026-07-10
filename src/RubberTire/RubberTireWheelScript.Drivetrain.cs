@@ -7,7 +7,11 @@ public partial class RubberTireWheelScript
 
     public bool enableDriveBrake = true;
     public bool invertDriveTorque = false;
-    public float maxDriveTorque = 8000f;
+    public bool enableEngineCurve = true;
+    public float enginePeakTorque = 450f;
+    public float enginePeakPower = 180000f;
+    public float enginePowerHoldRpm = 6000f;
+    public float engineRedlineRpm = 7500f;
     public bool enableGearbox = true;
     public float gearCount = 5f;
     public float gearRatio1 = 4.00f;
@@ -18,10 +22,6 @@ public partial class RubberTireWheelScript
     public float gearRatio6 = 0.75f;
     public float gearRatio7 = 0.55f;
     public float gearRatio8 = 0.40f;
-
-    public bool enablePowerLimit = true;
-    public float maxDrivePower = 120000f;
-    public float powerLimitOmegaEps = 1.0f;
 
     public bool enableRollingDamping = false;
     public float rollingDampingK = 0.25f;
@@ -36,16 +36,7 @@ public partial class RubberTireWheelScript
     public float brakeRise = 12f;
     public float brakeFall = 14f;
 
-    private MToggle uiDriveBrake, uiInvertDrive;
     private MKey uiKeyThrottle, uiKeyBrake, uiKeyReverse, uiKeyGearUp, uiKeyGearDown;
-    private MSlider uiMaxDriveTorque, uiMaxBrakeTorque, uiBrakeDeadband, uiBrakeHoldK;
-    private MToggle uiPowerLimit, uiGearbox;
-    private MSlider uiMaxDrivePower, uiPowerOmegaEps, uiGearCount;
-    private MSlider uiGearRatio1, uiGearRatio2, uiGearRatio3, uiGearRatio4;
-    private MSlider uiGearRatio5, uiGearRatio6, uiGearRatio7, uiGearRatio8;
-    private MToggle uiRollingDamp, uiLoadRollingResistance;
-    private MSlider uiRollingDampK, uiRollingResistanceCoeff;
-    private MSlider uiThrottleRise, uiThrottleFall, uiBrakeRise, uiBrakeFall;
 
     private float throttle01;
     private float brake01;
@@ -53,77 +44,20 @@ public partial class RubberTireWheelScript
     private float baseAngularDrag;
     private bool baseAngularDragCaptured;
 
-    private void CreateDrivetrainMapperControls()
+    // Fixed global shape choice: enough launch torque for direct coupling,
+    // without adding another per-engine tuning parameter.
+    private const float EngineZeroSpeedTorqueRatio = 0.65f;
+    private const float EngineTorqueRiseBaseFraction = 0.35f;
+    private const float RpmPerRadPerSecond = 9.5492966f;
+    private const float RadPerSecondPerRpm = 0.10471976f;
+
+    private void CreateDrivetrainKeyControls()
     {
-        uiDriveBrake = AddToggle("Drive/Brake (Keys)", "drv", enableDriveBrake);
-        uiInvertDrive = AddToggle("Invert Drive Torque", "invDrv", invertDriveTorque);
         uiKeyThrottle = AddKey("Throttle Key", "kThr", KeyCode.T);
         uiKeyBrake = AddKey("Brake Key", "kBrk", KeyCode.G);
         uiKeyReverse = AddKey("Reverse Key", "kRev", KeyCode.R);
-
-        uiGearbox = AddToggle("Gearbox", "gbx", enableGearbox);
         uiKeyGearUp = AddKey("Shift Up Key", "kGUp", KeyCode.PageUp);
         uiKeyGearDown = AddKey("Shift Down Key", "kGDn", KeyCode.PageDown);
-        uiGearCount = AddSlider("Gear Count", "gCnt", gearCount, 1f, 8f);
-        uiGearRatio1 = AddSlider("Gear 1 Ratio", "gR1", gearRatio1, 0.05f, 10f);
-        uiGearRatio2 = AddSlider("Gear 2 Ratio", "gR2", gearRatio2, 0.05f, 10f);
-        uiGearRatio3 = AddSlider("Gear 3 Ratio", "gR3", gearRatio3, 0.05f, 10f);
-        uiGearRatio4 = AddSlider("Gear 4 Ratio", "gR4", gearRatio4, 0.05f, 10f);
-        uiGearRatio5 = AddSlider("Gear 5 Ratio", "gR5", gearRatio5, 0.05f, 10f);
-        uiGearRatio6 = AddSlider("Gear 6 Ratio", "gR6", gearRatio6, 0.05f, 10f);
-        uiGearRatio7 = AddSlider("Gear 7 Ratio", "gR7", gearRatio7, 0.05f, 10f);
-        uiGearRatio8 = AddSlider("Gear 8 Ratio", "gR8", gearRatio8, 0.05f, 10f);
-
-        uiMaxDriveTorque = AddSlider("Max Drive Torque", "drvT", maxDriveTorque, 0f, 50000f);
-        uiPowerLimit = AddToggle("Power Limit", "pLim", enablePowerLimit);
-        uiMaxDrivePower = AddSlider("Max Drive Power (W)", "pMax", maxDrivePower, 0f, 500000f);
-        uiPowerOmegaEps = AddSlider("Power Omega Eps", "pEps", powerLimitOmegaEps, 0.1f, 20f);
-
-        uiRollingDamp = AddToggle("Rolling Resistance", "rDmp", enableRollingDamping);
-        uiRollingDampK = AddSlider("Rolling Damping K", "rK", rollingDampingK, 0f, 5000f);
-        uiLoadRollingResistance = AddToggle("ADV: Load Rolling Resist", "advRoll", useLoadSensitiveRollingResistance);
-        uiRollingResistanceCoeff = AddSlider("ADV: Roll Resist Coeff", "rrC", rollingResistanceCoeff, 0f, 0.20f);
-
-        uiMaxBrakeTorque = AddSlider("Max Brake Torque", "brkT", maxBrakeTorque, 0f, 80000f);
-        uiBrakeDeadband = AddSlider("Brake Deadband (rad/s)", "brkDb", brakeDeadbandOmega, 0f, 10f);
-        uiBrakeHoldK = AddSlider("Brake Hold K", "brkK", brakeHoldK, 0f, 20000f);
-        uiThrottleRise = AddSlider("Throttle Rise", "thrUp", throttleRise, 0f, 40f);
-        uiThrottleFall = AddSlider("Throttle Fall", "thrDn", throttleFall, 0f, 40f);
-        uiBrakeRise = AddSlider("Brake Rise 1/s", "brkUp", brakeRise, 0f, 40f);
-        uiBrakeFall = AddSlider("Brake Fall", "brkDn", brakeFall, 0f, 40f);
-    }
-
-    private void SyncDrivetrainParamsFromUI()
-    {
-        if (uiDriveBrake != null) enableDriveBrake = uiDriveBrake.IsActive;
-        if (uiInvertDrive != null) invertDriveTorque = uiInvertDrive.IsActive;
-        if (uiMaxDriveTorque != null) maxDriveTorque = uiMaxDriveTorque.Value;
-        if (uiGearbox != null) enableGearbox = uiGearbox.IsActive;
-        if (uiGearCount != null) gearCount = Mathf.Clamp(Mathf.Round(uiGearCount.Value), 1f, 8f);
-        if (uiGearRatio1 != null) gearRatio1 = uiGearRatio1.Value;
-        if (uiGearRatio2 != null) gearRatio2 = uiGearRatio2.Value;
-        if (uiGearRatio3 != null) gearRatio3 = uiGearRatio3.Value;
-        if (uiGearRatio4 != null) gearRatio4 = uiGearRatio4.Value;
-        if (uiGearRatio5 != null) gearRatio5 = uiGearRatio5.Value;
-        if (uiGearRatio6 != null) gearRatio6 = uiGearRatio6.Value;
-        if (uiGearRatio7 != null) gearRatio7 = uiGearRatio7.Value;
-        if (uiGearRatio8 != null) gearRatio8 = uiGearRatio8.Value;
-        currentGear = ClampGear(currentGear, GetGearCount());
-        if (uiPowerLimit != null) enablePowerLimit = uiPowerLimit.IsActive;
-        if (uiMaxDrivePower != null) maxDrivePower = uiMaxDrivePower.Value;
-        if (uiPowerOmegaEps != null) powerLimitOmegaEps = uiPowerOmegaEps.Value;
-
-        if (uiRollingDamp != null) enableRollingDamping = uiRollingDamp.IsActive;
-        if (uiRollingDampK != null) rollingDampingK = uiRollingDampK.Value;
-        if (uiLoadRollingResistance != null) useLoadSensitiveRollingResistance = uiLoadRollingResistance.IsActive;
-        if (uiRollingResistanceCoeff != null) rollingResistanceCoeff = uiRollingResistanceCoeff.Value;
-        if (uiMaxBrakeTorque != null) maxBrakeTorque = uiMaxBrakeTorque.Value;
-        if (uiBrakeDeadband != null) brakeDeadbandOmega = uiBrakeDeadband.Value;
-        if (uiBrakeHoldK != null) brakeHoldK = uiBrakeHoldK.Value;
-        if (uiThrottleRise != null) throttleRise = uiThrottleRise.Value;
-        if (uiThrottleFall != null) throttleFall = uiThrottleFall.Value;
-        if (uiBrakeRise != null) brakeRise = uiBrakeRise.Value;
-        if (uiBrakeFall != null) brakeFall = uiBrakeFall.Value;
     }
 
     private void ApplyDriveBrake()
@@ -144,24 +78,17 @@ public partial class RubberTireWheelScript
         Vector3 driveAxis = GetDriveAxisWorld();
         float omegaAxis = Vector3.Dot(Rigidbody.angularVelocity, driveAxis);
         float gearRatio = GetCurrentGearRatio();
-        float engineTorqueAtWheel = maxDriveTorque * gearRatio;
+        float engineRpm = Mathf.Abs(omegaAxis) * gearRatio * RpmPerRadPerSecond;
+        float engineTorque = enableEngineCurve
+            ? EvaluateEngineTorque(engineRpm)
+            : Mathf.Max(0f, enginePeakTorque);
+        float engineTorqueAtWheel = engineTorque * gearRatio;
         float tauDriveCmd = throttle01 * engineTorqueAtWheel;
 
         float driveSign = (Flipped ? -1f : 1f)
                         * (invertDriveTorque ? -1f : 1f)
                         * (heldRev ? -1f : 1f);
         tauDriveCmd *= driveSign;
-
-        if (enablePowerLimit && maxDrivePower > 0f)
-        {
-            float absOmega = Mathf.Abs(omegaAxis);
-            if (absOmega > Mathf.Max(1e-4f, powerLimitOmegaEps))
-            {
-                float tauMaxByPower = maxDrivePower / absOmega;
-                float tauMax = Mathf.Min(Mathf.Abs(engineTorqueAtWheel), tauMaxByPower);
-                tauDriveCmd = Mathf.Clamp(tauDriveCmd, -tauMax, tauMax);
-            }
-        }
 
         float tau = tauDriveCmd;
         if (brake01 > 1e-4f)
@@ -175,6 +102,52 @@ public partial class RubberTireWheelScript
 
         if (Mathf.Abs(tau) > 1e-6f)
             Rigidbody.AddTorque(driveAxis * tau, ForceMode.Force);
+    }
+
+    internal float EvaluateEngineTorque(float engineRpm)
+    {
+        float peakTorque = Mathf.Max(0f, enginePeakTorque);
+        float peakPower = Mathf.Max(0f, enginePeakPower);
+        if (peakTorque <= 1e-6f || peakPower <= 1e-6f) return 0f;
+
+        // T and P are independent controls. Their physically required
+        // crossover is derived rather than exposed as a redundant parameter.
+        float baseOmega = peakPower / peakTorque;
+        float baseRpm = baseOmega * RpmPerRadPerSecond;
+        baseRpm = Mathf.Max(1f, baseRpm);
+
+        float powerHoldRpm = Mathf.Max(baseRpm, enginePowerHoldRpm);
+        float redlineRpm = Mathf.Max(powerHoldRpm + 1f, engineRedlineRpm);
+        float rpm = Mathf.Max(0f, engineRpm);
+        if (rpm >= redlineRpm) return 0f;
+
+        float torqueRiseRpm = Mathf.Max(1f, baseRpm * EngineTorqueRiseBaseFraction);
+        if (rpm < torqueRiseRpm)
+        {
+            float u = SmoothStep01(rpm / torqueRiseRpm);
+            return Mathf.Lerp(
+                peakTorque * EngineZeroSpeedTorqueRatio,
+                peakTorque,
+                u);
+        }
+
+        if (rpm <= baseRpm)
+            return peakTorque;
+
+        float omega = Mathf.Max(1e-4f, rpm * RadPerSecondPerRpm);
+        if (rpm <= powerHoldRpm)
+            return peakPower / omega;
+
+        float falloff = 1f - SmoothStep01(
+            (rpm - powerHoldRpm)
+            / Mathf.Max(1f, redlineRpm - powerHoldRpm));
+        return peakPower * falloff / omega;
+    }
+
+    private float SmoothStep01(float value)
+    {
+        float u = Mathf.Clamp01(value);
+        return u * u * (3f - 2f * u);
     }
 
     private void UpdateGearboxInput()

@@ -20,7 +20,6 @@ public partial class RubberTireWheelScript
     public float lowSpeedCreepSpeed = 0.15f;
     public float lowSpeedCreepBlend = 0.75f;
     public float lowSpeedShearDampingC = 1200f;
-    public float axleSpinDampingK = 250f;
     public float axleAirDampingK = 2f;
     public float vEps = 0.2f;
 
@@ -34,84 +33,162 @@ public partial class RubberTireWheelScript
     public bool decoupleTireForceAndTorque = true;
     public bool enableDecoupledTireForceApplication = false;
 
-    private MSlider uiMuS, uiMuK, uiVStatic, uiFTau;
-    private MToggle uiEnableTire, uiRelax, uiDecouple;
-    private MSlider uiRelaxL, uiShearK, uiShearC, uiMaxShear;
-    private MToggle uiSinglePassLoad, uiCombinedSlip, uiModernLowSpeed, uiDecoupledApply;
-    private MSlider uiLongGrip, uiLatGrip, uiLowRelaxFloor, uiLowCreepSpeed;
-    private MSlider uiLowCreepBlend, uiLowShearDamping, uiAxleSpinDamping, uiAxleAirDamping;
-
     private class TirePointState
     {
         public Vector3 shearDispWorld = Vector3.zero;
         public Vector3 FtireFiltered = Vector3.zero;
+        public Vector3 lastPointWorld = Vector3.zero;
+        public Vector3 lastNormalWorld = Vector3.up;
+        public Vector3 lastConstraintSlipWorld = Vector3.zero;
+        public Vector3 lastConstraintImpulseWorld = Vector3.zero;
+        public bool hasConstraintHistory;
         public int lastSeenStep;
     }
 
-    private readonly Dictionary<ContactKey, TirePointState> pointStates =
-        new Dictionary<ContactKey, TirePointState>(64);
-    private readonly List<ContactKey> pointStatesToRemove = new List<ContactKey>(64);
+    private readonly Dictionary<int, TirePointState> pointStates =
+        new Dictionary<int, TirePointState>(16);
+    private readonly List<int> pointStatesToRemove = new List<int>(16);
 
-    private void CreateLateralMapperControls()
+    private struct LateralPatchAccumulator
     {
-        uiMuS = AddSlider("Mu Static", "muS", muStatic, 0f, 3f);
-        uiMuK = AddSlider("Mu Kinetic", "muK", muKinetic, 0f, 3f);
-        uiVStatic = AddSlider("vStatic (m/s)", "vStatic", vStatic, 0.01f, 2.0f);
-        uiFTau = AddSlider("Force Filter Tau (s)", "fTau", forceFilterTau, 0f, 0.20f);
-
-        uiSinglePassLoad = AddToggle("ADV: Single Load Scale", "advLoad", enableSinglePassLoadScaling);
-        uiCombinedSlip = AddToggle("ADV: Combined Slip", "advSlip", enableCombinedSlipFriction);
-        uiLongGrip = AddSlider("ADV: Long Grip Scale", "muLong", longitudinalGripScale, 0f, 3f);
-        uiLatGrip = AddSlider("ADV: Lat Grip Scale", "muLat", lateralGripScale, 0f, 3f);
-        uiModernLowSpeed = AddToggle("Modern Low Speed Tire", "mls", enableModernLowSpeedTire);
-        uiLowRelaxFloor = AddSlider("LowSpeed Relax Floor", "mlsRf", lowSpeedRelaxSpeedFloor, 0.05f, 5.0f);
-        uiLowCreepSpeed = AddSlider("LowSpeed Creep Speed", "mlsCv", lowSpeedCreepSpeed, 0.01f, 1.0f);
-        uiLowCreepBlend = AddSlider("LowSpeed Creep Blend", "mlsCb", lowSpeedCreepBlend, 0.05f, 3.0f);
-        uiLowShearDamping = AddSlider("LowSpeed Shear Damping", "mlsC", lowSpeedShearDampingC, 0f, 10000f);
-        uiAxleSpinDamping = AddSlider("Axle Spin Damping", "axDmp", axleSpinDampingK, 0f, 5000f);
-        uiAxleAirDamping = AddSlider("Axle Air Damping", "airDmp", axleAirDampingK, 0f, 100f);
-
-        uiEnableTire = AddToggle("Tire Model", "tire", enableTireModel);
-        uiRelax = AddToggle("Tire Relaxation", "relax", enableTireRelaxation);
-        uiRelaxL = AddSlider("Relax Length", "relaxL", relaxLength, 0.05f, 5.0f);
-        uiShearK = AddSlider("Shear K (N/m)", "shK", shearK, 1000f, 200000f);
-        uiShearC = AddSlider("Shear C (N*s/m)", "shC", shearC, 0f, 5000f);
-        uiMaxShear = AddSlider("Max Shear Disp", "shMax", maxShearDisp, 0.01f, 0.50f);
-
-        uiDecouple = AddToggle("Decouple F/T", "decouple", decoupleTireForceAndTorque);
-        uiDecoupledApply = AddToggle("ADV: Decoupled Apply", "advDec", enableDecoupledTireForceApplication);
+        public int key;
+        public Collider representativeCollider;
+        public Rigidbody groundBody;
+        public Vector3 weightedPoint;
+        public Vector3 weightedNormal;
+        public float normalLoad;
+        public float legacyScaleLoad;
+        public int debugIndex;
     }
 
-    private void SyncLateralParamsFromUI()
+    private readonly LateralPatchAccumulator[] lateralPatchBuffer =
+        new LateralPatchAccumulator[8];
+    private int lateralPatchCount;
+    private float factoryTireLongForce;
+    private float factoryTireLatForce;
+    private float factoryTireNormalLoad;
+
+    // Global solver constants, not per-tyre tuning parameters.
+    private const float StaticLockFullSpeed = 0.30f;
+    private const float StaticLockOffSpeed = 1.00f;
+    private const float StaticLockTimeConstant = 0.040f;
+    private const float StaticStateMaxPointJump = 0.75f;
+    private const float StaticStateMinNormalDot = 0.70f;
+
+    private void ResetLateralPatchAccumulators()
     {
-        if (uiMuS != null) muStatic = uiMuS.Value;
-        if (uiMuK != null) muKinetic = uiMuK.Value;
-        if (uiVStatic != null) vStatic = uiVStatic.Value;
-        if (uiFTau != null) forceFilterTau = uiFTau.Value;
+        lateralPatchCount = 0;
+        factoryTireLongForce = 0f;
+        factoryTireLatForce = 0f;
+        factoryTireNormalLoad = 0f;
+    }
 
-        if (uiSinglePassLoad != null) enableSinglePassLoadScaling = uiSinglePassLoad.IsActive;
-        if (uiCombinedSlip != null) enableCombinedSlipFriction = uiCombinedSlip.IsActive;
-        if (uiLongGrip != null) longitudinalGripScale = uiLongGrip.Value;
-        if (uiLatGrip != null) lateralGripScale = uiLatGrip.Value;
-        if (uiModernLowSpeed != null) enableModernLowSpeedTire = uiModernLowSpeed.IsActive;
-        if (uiLowRelaxFloor != null) lowSpeedRelaxSpeedFloor = uiLowRelaxFloor.Value;
-        if (uiLowCreepSpeed != null) lowSpeedCreepSpeed = uiLowCreepSpeed.Value;
-        if (uiLowCreepBlend != null) lowSpeedCreepBlend = uiLowCreepBlend.Value;
-        if (uiLowShearDamping != null) lowSpeedShearDampingC = uiLowShearDamping.Value;
-        if (uiAxleSpinDamping != null) axleSpinDampingK = uiAxleSpinDamping.Value;
-        if (uiAxleAirDamping != null) axleAirDampingK = uiAxleAirDamping.Value;
+    private int AccumulateLateralPatch(
+        ContactSample sample,
+        Vector3 contactNormal,
+        Rigidbody groundBody,
+        float normalLoad,
+        float legacyExtraScale)
+    {
+        // A dynamic body is one coupled contact island. Static colliders have
+        // no shared Rigidbody, so keep them separate to avoid averaging a
+        // floor and a neighbouring kerb into one fictitious plane.
+        int key = groundBody != null
+            ? groundBody.GetInstanceID()
+            : (sample.col != null ? sample.col.GetInstanceID() : 0);
+        int index = -1;
+        for (int i = 0; i < lateralPatchCount; i++)
+        {
+            if (lateralPatchBuffer[i].key == key)
+            {
+                index = i;
+                break;
+            }
+        }
 
-        if (uiEnableTire != null) enableTireModel = uiEnableTire.IsActive;
-        if (uiRelax != null) enableTireRelaxation = uiRelax.IsActive;
-        if (uiRelaxL != null) relaxLength = uiRelaxL.Value;
-        if (uiShearK != null) shearK = uiShearK.Value;
-        if (uiShearC != null) shearC = uiShearC.Value;
-        if (uiMaxShear != null) maxShearDisp = uiMaxShear.Value;
-        if (uiDecouple != null) decoupleTireForceAndTorque = uiDecouple.IsActive;
-        if (uiDecoupledApply != null) enableDecoupledTireForceApplication = uiDecoupledApply.IsActive;
+        if (index < 0)
+        {
+            if (lateralPatchCount >= lateralPatchBuffer.Length) return -1;
+            index = lateralPatchCount++;
+            LateralPatchAccumulator created = new LateralPatchAccumulator();
+            created.key = key;
+            created.representativeCollider = sample.col;
+            created.groundBody = groundBody;
+            created.debugIndex = -1;
+            lateralPatchBuffer[index] = created;
+        }
+
+        LateralPatchAccumulator patch = lateralPatchBuffer[index];
+        patch.weightedPoint += sample.p * normalLoad;
+        patch.weightedNormal += contactNormal * normalLoad;
+        patch.normalLoad += normalLoad;
+        patch.legacyScaleLoad += normalLoad * legacyExtraScale;
+        lateralPatchBuffer[index] = patch;
+        return index;
+    }
+
+    private void AttachLateralPatchDebugIndex(int patchIndex, int debugIndex)
+    {
+        if (patchIndex < 0 || patchIndex >= lateralPatchCount) return;
+        LateralPatchAccumulator patch = lateralPatchBuffer[patchIndex];
+        if (patch.debugIndex < 0) patch.debugIndex = debugIndex;
+        lateralPatchBuffer[patchIndex] = patch;
+    }
+
+    private void ApplyAccumulatedLateralPatches(
+        Vector3 wheelAxis,
+        float fixedDeltaTime,
+        bool updateDebug)
+    {
+        for (int i = 0; i < lateralPatchCount; i++)
+        {
+            LateralPatchAccumulator patch = lateralPatchBuffer[i];
+            if (patch.normalLoad <= 1e-6f) continue;
+
+            ContactSample sample = new ContactSample();
+            sample.col = patch.representativeCollider;
+            sample.colId = patch.representativeCollider != null
+                ? patch.representativeCollider.GetInstanceID()
+                : 0;
+            sample.p = patch.weightedPoint / patch.normalLoad;
+            sample.n = patch.weightedNormal;
+            if (sample.n.sqrMagnitude > 1e-10f) sample.n.Normalize();
+            else sample.n = Vector3.up;
+
+            float legacyScale = patch.legacyScaleLoad / patch.normalLoad;
+            Vector3 force = EvaluateAndApplyTireForce(
+                patch.key,
+                sample,
+                sample.n,
+                patch.groundBody,
+                wheelAxis,
+                patch.normalLoad,
+                legacyScale,
+                1f,
+                fixedDeltaTime);
+
+            Vector3 forward = ProjectOnPlane(Vector3.Cross(sample.n, wheelAxis), sample.n);
+            if (forward.sqrMagnitude > 1e-8f) forward.Normalize();
+            Vector3 side = ProjectOnPlane(wheelAxis, sample.n);
+            if (side.sqrMagnitude > 1e-8f) side.Normalize();
+            factoryTireLongForce += Vector3.Dot(force, forward);
+            factoryTireLatForce += Vector3.Dot(force, side);
+            factoryTireNormalLoad += patch.normalLoad;
+
+            if (updateDebug
+                && patch.debugIndex >= 0
+                && patch.debugIndex < dbgLocalCount)
+            {
+                DebugContactLocalData debugData = dbgLocalContacts[patch.debugIndex];
+                debugData.FtWorld = force;
+                debugData.FtMag = force.magnitude;
+                dbgLocalContacts[patch.debugIndex] = debugData;
+            }
+        }
     }
 
     private Vector3 EvaluateAndApplyTireForce(
+        int patchKey,
         ContactSample sample,
         Vector3 contactNormal,
         Rigidbody groundBody,
@@ -151,12 +228,14 @@ public partial class RubberTireWheelScript
 
         Vector3 slipVelocity = ProjectOnPlane(relativeVelocity, contactNormal);
         float slipSpeed = slipVelocity.magnitude;
+        TirePointState state = GetOrCreatePatchState(
+            patchKey,
+            sample.p,
+            contactNormal);
+        state.lastSeenStep = fixedStepCounter;
 
         if (enableTireRelaxation)
         {
-            TirePointState state = GetOrCreatePointState(sample.col, sample.p);
-            state.lastSeenStep = fixedStepCounter;
-
             if (enableSinglePassLoadScaling || enableCombinedSlipFriction || enableModernLowSpeedTire)
                 state.shearDispWorld = ProjectOnPlane(state.shearDispWorld, contactNormal);
 
@@ -300,9 +379,286 @@ public partial class RubberTireWheelScript
             tireForce *= sampleWeight;
         }
 
-        if (tireForce.sqrMagnitude > 1e-10f)
-            ApplyTireForce(tireForce, sample.p, groundBody, wheelAxis);
-        return tireForce;
+        return ApplyLowSpeedStaticConstraint(
+            state,
+            tireForce,
+            slipVelocity,
+            forward,
+            side,
+            contactNormal,
+            sample.p,
+            groundBody,
+            wheelAxis,
+            normalLoad,
+            fixedDeltaTime);
+    }
+
+    private Vector3 ApplyLowSpeedStaticConstraint(
+        TirePointState state,
+        Vector3 dynamicForce,
+        Vector3 slipVelocity,
+        Vector3 forward,
+        Vector3 side,
+        Vector3 contactNormal,
+        Vector3 point,
+        Rigidbody groundBody,
+        Vector3 wheelAxis,
+        float normalLoad,
+        float fixedDeltaTime)
+    {
+        Vector3 groundLinearVelocity = groundBody != null
+            ? groundBody.GetPointVelocity(point)
+            : Vector3.zero;
+        Vector3 rollingVelocity = ProjectOnPlane(
+            Rigidbody.velocity - groundLinearVelocity,
+            contactNormal);
+        float rollingSpeed = rollingVelocity.magnitude;
+
+        float lockBlend = 1f - Mathf.Clamp01(
+            (rollingSpeed - StaticLockFullSpeed)
+            / Mathf.Max(1e-4f, StaticLockOffSpeed - StaticLockFullSpeed));
+        lockBlend = lockBlend * lockBlend * (3f - 2f * lockBlend);
+
+        if (!enableModernLowSpeedTire || lockBlend <= 1e-4f)
+        {
+            ResetStaticConstraintHistory(state);
+            if (dynamicForce.sqrMagnitude > 1e-10f)
+                ApplyTireForce(dynamicForce, point, groundBody, wheelAxis);
+            return dynamicForce;
+        }
+
+        Vector3 staticImpulse;
+        bool canStick = TrySolveStaticImpulse(
+            state,
+            slipVelocity,
+            forward,
+            side,
+            point,
+            groundBody,
+            normalLoad,
+            fixedDeltaTime,
+            out staticImpulse);
+
+        if (!canStick)
+        {
+            ResetStaticConstraintHistory(state);
+            if (dynamicForce.sqrMagnitude > 1e-10f)
+                ApplyTireForce(dynamicForce, point, groundBody, wheelAxis);
+            return dynamicForce;
+        }
+
+        Vector3 dynamicImpulse = dynamicForce * fixedDeltaTime;
+        Vector3 blendedImpulse = Vector3.Lerp(dynamicImpulse, staticImpulse, lockBlend);
+        blendedImpulse = ClampStaticImpulse(
+            blendedImpulse,
+            forward,
+            side,
+            normalLoad * fixedDeltaTime);
+        if (blendedImpulse.sqrMagnitude > 1e-12f)
+            ApplyTireImpulse(blendedImpulse, point, groundBody, wheelAxis);
+        state.lastConstraintSlipWorld = slipVelocity;
+        state.lastConstraintImpulseWorld = blendedImpulse;
+        state.hasConstraintHistory = true;
+        return blendedImpulse / Mathf.Max(1e-5f, fixedDeltaTime);
+    }
+
+    private bool TrySolveStaticImpulse(
+        TirePointState state,
+        Vector3 slipVelocity,
+        Vector3 forward,
+        Vector3 side,
+        Vector3 point,
+        Rigidbody groundBody,
+        float normalLoad,
+        float fixedDeltaTime,
+        out Vector3 impulseWorld)
+    {
+        impulseWorld = Vector3.zero;
+        if (normalLoad <= 1e-6f) return false;
+        if (side.sqrMagnitude <= 1e-8f) return false;
+
+        float kFF = GetRelativePointVelocityResponse(forward, forward, point, groundBody);
+        float kFS = GetRelativePointVelocityResponse(forward, side, point, groundBody);
+        float kSF = GetRelativePointVelocityResponse(side, forward, point, groundBody);
+        // The analytical effective-mass matrix is symmetric. Averaging the
+        // cross terms suppresses small floating-point asymmetry and keeps the
+        // velocity correction passive.
+        float kCross = 0.5f * (kFS + kSF);
+        kFS = kCross;
+        kSF = kCross;
+        float kSS = GetRelativePointVelocityResponse(side, side, point, groundBody);
+        float determinant = kFF * kSS - kFS * kSF;
+        if (determinant <= 1e-8f) return false;
+
+        float dt = Mathf.Max(1e-5f, fixedDeltaTime);
+        float velocityForward = Vector3.Dot(slipVelocity, forward);
+        float velocitySide = Vector3.Dot(slipVelocity, side);
+
+        // Estimate the unobserved per-step disturbance from the previous
+        // velocity transition. This supplies the sustained reaction needed
+        // for true sticking under gravity or chassis loads without blindly
+        // reapplying an old impulse after that load disappears.
+        float disturbanceForward = 0f;
+        float disturbanceSide = 0f;
+        if (state.hasConstraintHistory)
+        {
+            float previousVelocityForward = Vector3.Dot(
+                state.lastConstraintSlipWorld,
+                forward);
+            float previousVelocitySide = Vector3.Dot(
+                state.lastConstraintSlipWorld,
+                side);
+            float previousImpulseForward = Vector3.Dot(
+                state.lastConstraintImpulseWorld,
+                forward);
+            float previousImpulseSide = Vector3.Dot(
+                state.lastConstraintImpulseWorld,
+                side);
+            disturbanceForward = velocityForward
+                               - previousVelocityForward
+                               - kFF * previousImpulseForward
+                               - kFS * previousImpulseSide;
+            disturbanceSide = velocitySide
+                            - previousVelocitySide
+                            - kSF * previousImpulseForward
+                            - kSS * previousImpulseSide;
+        }
+
+        float correction = 1f - Mathf.Exp(-dt / StaticLockTimeConstant);
+        float inverseDeterminant = 1f / determinant;
+        float targetForward = correction * velocityForward + disturbanceForward;
+        float targetSide = correction * velocitySide + disturbanceSide;
+        float deltaForward = -(kSS * targetForward - kFS * targetSide)
+                           * inverseDeterminant;
+        float deltaSide = -(-kSF * targetForward + kFF * targetSide)
+                        * inverseDeterminant;
+
+        float candidateForward = deltaForward;
+        float candidateSide = deltaSide;
+        float normalImpulse = normalLoad * dt;
+        float maximumForward = muStatic
+                             * (enableCombinedSlipFriction
+                                ? Mathf.Max(0f, longitudinalGripScale)
+                                : 1f)
+                             * normalImpulse;
+        float maximumSide = muStatic
+                          * (enableCombinedSlipFriction
+                             ? Mathf.Max(0f, lateralGripScale)
+                             : 1f)
+                          * normalImpulse;
+
+        float usage = GetEllipseUsage(
+            candidateForward,
+            candidateSide,
+            maximumForward,
+            maximumSide);
+        if (usage > 1f)
+        {
+            if (!state.hasConstraintHistory) return false;
+
+            // A near-limit static load may leave no friction budget for
+            // removing all residual velocity in one step. Stay in the static
+            // branch when the estimated sustaining reaction itself fits, and
+            // use the rim of the ellipse to arrest the residual over time.
+            float sustainForward = -(kSS * disturbanceForward
+                                   - kFS * disturbanceSide)
+                                 * inverseDeterminant;
+            float sustainSide = -(-kSF * disturbanceForward
+                                + kFF * disturbanceSide)
+                              * inverseDeterminant;
+            float sustainUsage = GetEllipseUsage(
+                sustainForward,
+                sustainSide,
+                maximumForward,
+                maximumSide);
+            if (sustainUsage > 1f) return false;
+
+            float scale = 1f / Mathf.Sqrt(usage);
+            candidateForward *= scale;
+            candidateSide *= scale;
+        }
+
+        impulseWorld = forward * candidateForward + side * candidateSide;
+        return true;
+    }
+
+    private void ResetStaticConstraintHistory(TirePointState state)
+    {
+        state.lastConstraintSlipWorld = Vector3.zero;
+        state.lastConstraintImpulseWorld = Vector3.zero;
+        state.hasConstraintHistory = false;
+    }
+
+    private float GetRelativePointVelocityResponse(
+        Vector3 measureAxis,
+        Vector3 impulseAxis,
+        Vector3 point,
+        Rigidbody groundBody)
+    {
+        Vector3 response = GetPointVelocityChange(Rigidbody, point, impulseAxis);
+        if (groundBody != null && groundBody != Rigidbody)
+            response += GetPointVelocityChange(groundBody, point, impulseAxis);
+        return Vector3.Dot(measureAxis, response);
+    }
+
+    private Vector3 GetPointVelocityChange(
+        Rigidbody body,
+        Vector3 point,
+        Vector3 impulse)
+    {
+        if (body == null || body.isKinematic) return Vector3.zero;
+
+        Vector3 linear = body.mass > 1e-6f
+            ? impulse / body.mass
+            : Vector3.zero;
+        Vector3 arm = point - body.worldCenterOfMass;
+        Vector3 angularImpulse = Vector3.Cross(arm, impulse);
+        Vector3 angularVelocity = MultiplyWorldInverseInertia(body, angularImpulse);
+        return linear + Vector3.Cross(angularVelocity, arm);
+    }
+
+    private Vector3 ClampStaticImpulse(
+        Vector3 impulse,
+        Vector3 forward,
+        Vector3 side,
+        float normalImpulse)
+    {
+        float maximumForward = muStatic
+                             * (enableCombinedSlipFriction
+                                ? Mathf.Max(0f, longitudinalGripScale)
+                                : 1f)
+                             * normalImpulse;
+        float maximumSide = muStatic
+                          * (enableCombinedSlipFriction
+                             ? Mathf.Max(0f, lateralGripScale)
+                             : 1f)
+                          * normalImpulse;
+        float forwardImpulse = Vector3.Dot(impulse, forward);
+        float sideImpulse = Vector3.Dot(impulse, side);
+        float usage = GetEllipseUsage(
+            forwardImpulse,
+            sideImpulse,
+            maximumForward,
+            maximumSide);
+        if (usage > 1f)
+        {
+            float scale = 1f / Mathf.Sqrt(usage);
+            forwardImpulse *= scale;
+            sideImpulse *= scale;
+        }
+        return forward * forwardImpulse + side * sideImpulse;
+    }
+
+    private float GetEllipseUsage(
+        float forwardValue,
+        float sideValue,
+        float maximumForward,
+        float maximumSide)
+    {
+        if (maximumForward <= 1e-8f || maximumSide <= 1e-8f)
+            return float.PositiveInfinity;
+        return forwardValue * forwardValue / (maximumForward * maximumForward)
+             + sideValue * sideValue / (maximumSide * maximumSide);
     }
 
     private void ApplyTireForce(
@@ -333,6 +689,39 @@ public partial class RubberTireWheelScript
 
         if (groundRb != null)
             groundRb.AddForceAtPosition(-force, point, ForceMode.Force);
+    }
+
+    private void ApplyTireImpulse(
+        Vector3 impulse,
+        Vector3 point,
+        Rigidbody groundRb,
+        Vector3 wheelAxisWorld)
+    {
+        bool useDecoupled = enableDecoupledTireForceApplication
+                         && decoupleTireForceAndTorque;
+        if (useDecoupled)
+        {
+            Rigidbody.AddForce(impulse, ForceMode.Impulse);
+            if (wheelAxisWorld.sqrMagnitude > 1e-10f)
+            {
+                wheelAxisWorld.Normalize();
+                Vector3 angularImpulse = Vector3.Cross(
+                    point - Rigidbody.worldCenterOfMass,
+                    impulse);
+                float spinImpulse = Vector3.Dot(angularImpulse, wheelAxisWorld);
+                if (Mathf.Abs(spinImpulse) > 1e-8f)
+                    Rigidbody.AddTorque(
+                        wheelAxisWorld * spinImpulse,
+                        ForceMode.Impulse);
+            }
+        }
+        else
+        {
+            Rigidbody.AddForceAtPosition(impulse, point, ForceMode.Impulse);
+        }
+
+        if (groundRb != null)
+            groundRb.AddForceAtPosition(-impulse, point, ForceMode.Impulse);
     }
 
     private Vector3 LimitVectorMagnitude(Vector3 v, float maxMagnitude)
@@ -413,16 +802,14 @@ public partial class RubberTireWheelScript
         float omega = Vector3.Dot(Rigidbody.angularVelocity, wheelAxisWorld);
         if (Mathf.Abs(omega) <= 1e-5f) return;
         bool hasLoad = normalLoad > 1e-6f && radius > 1e-6f;
-        float dampingK = hasLoad ? axleSpinDampingK : axleAirDampingK;
+        // Loaded-wheel absolute omega damping fights pure rolling and destroys
+        // coasting. Contact-patch friction now handles loaded stabilization;
+        // this helper is only a free-spin bearing/air damping fallback.
+        if (hasLoad) return;
+        float dampingK = axleAirDampingK;
         if (dampingK <= 0f) return;
 
         float tau = -omega * dampingK;
-        if (hasLoad)
-        {
-            float tauLimit = Mathf.Max(0f, muStatic) * normalLoad * radius;
-            if (tauLimit > 1e-6f) tau = Mathf.Clamp(tau, -tauLimit, tauLimit);
-        }
-
         float inertia = GetInertiaAroundWorldAxis(wheelAxisWorld);
         float dt = Mathf.Max(1e-5f, Time.fixedDeltaTime);
         if (inertia > 1e-6f)

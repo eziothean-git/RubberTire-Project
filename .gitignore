@@ -1,0 +1,19 @@
+# Local agent/editor state
+.agents/
+.codex/
+.vs/
+
+# Visual Studio / MSBuild output
+**/bin/
+**/obj/
+*.user
+*.suo
+*.pdb
+
+# Local helper commands and logs
+src/RubberTire/compile cmd
+*.log
+
+# OS metadata
+.DS_Store
+Thumbs.db
