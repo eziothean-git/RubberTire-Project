@@ -58,6 +58,7 @@ public partial class RubberTireWheelScript
     private int currentGear = 1;
     private bool engineLimiterCut;
     private float currentEngineRpm;
+    private float currentEngineRawRpm;
     private float baseAngularDrag;
     private bool baseAngularDragCaptured;
 
@@ -136,12 +137,16 @@ public partial class RubberTireWheelScript
         float rawEngineRpm = drivenWheel
             ? Mathf.Abs(omegaAxis) * totalRatio * RpmPerRadPerSecond
             : 0f;
+        currentEngineRawRpm = rawEngineRpm;
         float rpmFilter = Mathf.Max(0f, engineRpmFilterTau);
         float rpmAlpha = rpmFilter > 1e-5f
             ? 1f - Mathf.Exp(-dt / rpmFilter)
             : 1f;
         currentEngineRpm = Mathf.Lerp(currentEngineRpm, rawEngineRpm, rpmAlpha);
-        float engineRpm = currentEngineRpm;
+        // The wheel and gearbox kinematically define engine speed in this
+        // simplified locked-clutch model. Filtering is telemetry only: using
+        // delayed RPM for torque and the limiter pumps energy past redline.
+        float engineRpm = rawEngineRpm;
         if (drivenWheel) UpdateEngineLimiter(engineRpm);
         else engineLimiterCut = false;
         float engineTorque = drivenWheel && enableEngineCurve
@@ -165,10 +170,10 @@ public partial class RubberTireWheelScript
         float tauCoast = 0f;
         if (drivenWheel
             && engineCoastTorque > 0f
-            && throttle01 < 0.999f
+            && (throttle01 < 0.999f || engineLimiterCut)
             && Mathf.Abs(omegaAxis) > Mathf.Max(1e-4f, brakeDeadbandOmega))
         {
-            float coastBlend = 1f - throttle01;
+            float coastBlend = engineLimiterCut ? 1f : 1f - throttle01;
             tauCoast = -Mathf.Sign(omegaAxis)
                 * engineCoastTorque
                 * transmissionScale
@@ -259,7 +264,12 @@ public partial class RubberTireWheelScript
                 Mathf.Max(engineLutTorque[i - 1], engineLutTorque[i]));
             return Mathf.Max(0f, torque);
         }
-        return Mathf.Max(0f, engineLutTorque[engineLutPointCount - 1]);
+        int last = engineLutPointCount - 1;
+        float lastRpm = engineLutRpm[last];
+        float lastTorque = Mathf.Max(0f, engineLutTorque[last]);
+        float redline = Mathf.Max(lastRpm + 1e-4f, engineRedlineRpm);
+        float tailU = Mathf.Clamp01((rpm - lastRpm) / (redline - lastRpm));
+        return lastTorque * (1f - SmoothStep01(tailU));
     }
 
     // C5: single source of truth for the curve breakpoints; the factory UI
@@ -573,6 +583,7 @@ public partial class RubberTireWheelScript
 
     internal float FactoryCurrentTotalDriveRatio() { return GetCurrentTotalDriveRatio(); }
     internal bool FactoryLimiterCut() { return engineLimiterCut; }
+    internal float FactoryCurrentRawEngineRpm() { return Mathf.Max(0f, currentEngineRawRpm); }
 
     private float GetGearRatio(int gear)
     {

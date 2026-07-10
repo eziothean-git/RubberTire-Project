@@ -406,7 +406,12 @@ public partial class RubberTireWheelScript
                 float filterAlpha = 1f - Mathf.Exp(
                     -fixedDeltaTime / Mathf.Max(1e-5f, forceFilterTau));
                 state.FtireFiltered = Vector3.Lerp(state.FtireFiltered, rawForce, filterAlpha);
-                tireForce = state.FtireFiltered;
+                tireForce = RemoveActiveSlipPower(
+                    state.FtireFiltered, slipVelocity);
+                // Do not retain a force component which now accelerates the
+                // relative contact motion. That delayed component is the
+                // non-passive second state responsible for high-speed chatter.
+                state.FtireFiltered = tireForce;
             }
             else
             {
@@ -464,6 +469,15 @@ public partial class RubberTireWheelScript
             wheelAxis,
             normalLoad,
             fixedDeltaTime);
+    }
+
+    private Vector3 RemoveActiveSlipPower(Vector3 force, Vector3 slipVelocity)
+    {
+        float slipSqr = slipVelocity.sqrMagnitude;
+        if (slipSqr <= 1e-10f) return force;
+        float activePower = Vector3.Dot(force, slipVelocity);
+        if (activePower <= 0f) return force;
+        return force - slipVelocity * (activePower / slipSqr);
     }
 
     private Vector3 GetNominalTreadPoint(

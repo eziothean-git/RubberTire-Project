@@ -1109,7 +1109,8 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
             chartLive.text = "GEAR " + target.FactoryCurrentGearLabel()
                 + "   THR " + Mathf.RoundToInt(target.FactoryThrottle01() * 100f) + "%"
                 + "   BRK " + Mathf.RoundToInt(target.FactoryBrake01() * 100f) + "%"
-                + "   RPM " + Mathf.Max(0f, target.FactoryCurrentEngineRpm()).ToString("0")
+                + "   RPM " + target.FactoryCurrentRawEngineRpm().ToString("0")
+                + " (filt " + Mathf.Max(0f, target.FactoryCurrentEngineRpm()).ToString("0") + ")"
                 + (target.FactoryLimiterCut() ? "   LIMIT" : "")
                 + "   gear cap "
                 + target.FactoryGearWheelOmegaLimit(target.FactoryCurrentGear()).ToString("0.0")

@@ -275,7 +275,8 @@ public sealed class RubberTireEngineDashboard : MonoBehaviour
                 + (driven ? "  DRIVE" : "  FREE / BRAKE");
             row.Telemetry.text = driven
                 ? "GEAR " + wheel.FactoryCurrentGearLabel()
-                    + "   RPM " + Mathf.Max(0f, wheel.FactoryCurrentEngineRpm()).ToString("0")
+                    + "   RPM " + wheel.FactoryCurrentRawEngineRpm().ToString("0")
+                    + "   F " + Mathf.Max(0f, wheel.FactoryCurrentEngineRpm()).ToString("0")
                     + "\nTHR " + Mathf.RoundToInt(wheel.FactoryThrottle01() * 100f) + "%"
                     + "   BRK " + Mathf.RoundToInt(wheel.FactoryBrake01() * 100f) + "%"
                     + (wheel.FactoryLimiterCut() ? "  LIMIT" : "")
@@ -294,7 +295,7 @@ public sealed class RubberTireEngineDashboard : MonoBehaviour
             if (driven)
             {
                 compact += "[" + wheel.FactoryCurrentGearLabel() + "]   "
-                    + Mathf.Max(0f, wheel.FactoryCurrentEngineRpm()).ToString("0").PadLeft(5)
+                    + wheel.FactoryCurrentRawEngineRpm().ToString("0").PadLeft(5)
                     + " RPM";
                 if (wheel.FactoryLimiterCut()) compact += "  LIMIT";
             }

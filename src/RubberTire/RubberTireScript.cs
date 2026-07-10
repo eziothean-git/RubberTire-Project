@@ -245,6 +245,7 @@ public partial class RubberTireWheelScript : BlockScript
         brake01 = 0f;
         engineLimiterCut = false;
         currentEngineRpm = 0f;
+        currentEngineRawRpm = 0f;
         adaptiveRadialCursor = 1;
         lastSuccessfulRadialSector = -1;
         lastRaycastQueryCount = 0;
@@ -285,6 +286,7 @@ public partial class RubberTireWheelScript : BlockScript
         brake01 = 0f;
         engineLimiterCut = false;
         currentEngineRpm = 0f;
+        currentEngineRawRpm = 0f;
         lastStepHadRaycastContact = false;
         consecutiveNoContactSteps = 0;
         jointParentCached = false;
