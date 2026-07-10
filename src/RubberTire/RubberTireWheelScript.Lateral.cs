@@ -466,7 +466,7 @@ public partial class RubberTireWheelScript
             return dynamicForce;
         }
 
-        // B1: feed the self-applied drive/brake torque of THIS step forward so
+        // B1: feed the self-applied propulsion torque of THIS step forward so
         // the solver does not wait a step for the disturbance estimator.
         float feedForwardForward = 0f;
         float feedForwardSide = 0f;

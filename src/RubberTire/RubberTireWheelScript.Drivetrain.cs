@@ -1,3 +1,6 @@
+using System;
+using System.Globalization;
+using System.Text;
 using UnityEngine;
 using Modding;
 
@@ -9,9 +12,17 @@ public partial class RubberTireWheelScript
     public bool invertDriveTorque = false;
     public bool enableEngineCurve = true;
     public float enginePeakTorque = 450f;
+    // Retained for loading old machine records; the AC-style torque LUT replaces
+    // the generated constant-power plateau when enableEngineCurve is true.
     public float enginePeakPower = 180000f;
     public float enginePowerHoldRpm = 6000f;
+    public float engineIdleRpm = 900f;
     public float engineRedlineRpm = 7500f;
+    public float engineLimiterHysteresisRpm = 250f;
+    public float engineCoastTorque = 20f;
+    public float finalDriveRatio = 10f;
+    public float drivetrainEfficiency = 0.90f;
+    public string engineTorqueLut = DefaultEngineTorqueLut;
     public bool enableGearbox = true;
     public float gearCount = 5f;
     public float gearRatio1 = 4.00f;
@@ -41,15 +52,27 @@ public partial class RubberTireWheelScript
     private float throttle01;
     private float brake01;
     private int currentGear = 1;
+    private bool engineLimiterCut;
+    private float currentEngineRpm;
     private float baseAngularDrag;
     private bool baseAngularDragCaptured;
 
-    // Fixed global shape choice: enough launch torque for direct coupling,
-    // without adding another per-engine tuning parameter.
-    private const float EngineZeroSpeedTorqueRatio = 0.65f;
-    private const float EngineTorqueRiseBaseFraction = 0.35f;
+    internal const string DefaultEngineTorqueLut =
+        "0|290\n" +
+        "1000|340\n" +
+        "2000|410\n" +
+        "3500|450\n" +
+        "5000|430\n" +
+        "6000|380\n" +
+        "7000|300\n" +
+        "7500|0";
+    private const int MaximumEngineLutPoints = 32;
     private const float RpmPerRadPerSecond = 9.5492966f;
     private const float RadPerSecondPerRpm = 0.10471976f;
+    private readonly float[] engineLutRpm = new float[MaximumEngineLutPoints];
+    private readonly float[] engineLutTorque = new float[MaximumEngineLutPoints];
+    private int engineLutPointCount;
+    private string parsedEngineTorqueLut;
 
     private void CreateDrivetrainKeyControls()
     {
@@ -60,9 +83,10 @@ public partial class RubberTireWheelScript
         uiKeyGearDown = AddKey("Shift Down Key", "kGDn", KeyCode.PageDown);
     }
 
-    // B1: wheel-axis torque self-applied this step (drive+brake+test hook).
-    // The static friction solver feeds it forward instead of waiting a step
-    // for the disturbance estimator to learn it.
+    // B1: wheel-axis PROPULSION torque self-applied this step.  The static
+    // friction solver feeds this forward instead of waiting a step for the
+    // disturbance estimator to learn it.  Brake/coast torque must never enter
+    // this channel: doing so makes static friction cancel the brake itself.
     private float pendingDriveAxisTorque;
     private Vector3 pendingDriveAxisWorld = Vector3.up;
 
@@ -90,33 +114,70 @@ public partial class RubberTireWheelScript
         Rigidbody parentBody = GetJointParentBody();
         if (parentBody != null)
             omegaAxis -= Vector3.Dot(parentBody.angularVelocity, driveAxis);
-        float gearRatio = GetCurrentGearRatio();
-        float engineRpm = Mathf.Abs(omegaAxis) * gearRatio * RpmPerRadPerSecond;
+        float totalRatio = GetCurrentTotalDriveRatio();
+        float engineRpm = Mathf.Abs(omegaAxis) * totalRatio * RpmPerRadPerSecond;
+        currentEngineRpm = engineRpm;
+        UpdateEngineLimiter(engineRpm);
         float engineTorque = enableEngineCurve
-            ? EvaluateEngineTorque(engineRpm)
+            ? EvaluateEngineTorque(Mathf.Max(engineIdleRpm, engineRpm))
             : Mathf.Max(0f, enginePeakTorque);
-        float engineTorqueAtWheel = engineTorque * gearRatio;
+        if (engineLimiterCut) engineTorque = 0f;
+        float transmissionScale = totalRatio * Mathf.Clamp01(drivetrainEfficiency);
+        float engineTorqueAtWheel = engineTorque * transmissionScale;
         float tauDriveCmd = throttle01 * engineTorqueAtWheel;
 
         float driveSign = (Flipped ? -1f : 1f)
                         * (invertDriveTorque ? -1f : 1f)
                         * (heldRev ? -1f : 1f);
-        tauDriveCmd *= driveSign;
+        // Brake input wins over throttle instead of making the two fight at
+        // the axle while the inputs are ramping in opposite directions.
+        tauDriveCmd *= driveSign * (1f - Mathf.Clamp01(brake01));
 
-        float tau = tauDriveCmd;
+        // Only propulsion is subject to the spin pumping guard and contact
+        // feed-forward. Braking and coast are dissipative wheel torques.
+        float tauDrive = ClampSpinPumpingTorque(tauDriveCmd, omegaAxisAbs, driveAxis, dt);
+        float tauCoast = 0f;
+        if (engineCoastTorque > 0f
+            && throttle01 < 0.999f
+            && Mathf.Abs(omegaAxis) > Mathf.Max(1e-4f, brakeDeadbandOmega))
+        {
+            float coastBlend = 1f - throttle01;
+            tauCoast = -Mathf.Sign(omegaAxis)
+                * engineCoastTorque
+                * transmissionScale
+                * coastBlend;
+        }
+
+        float tauBrake = 0f;
         if (brake01 > 1e-4f)
         {
             float tauBMax = brake01 * maxBrakeTorque;
-            if (Mathf.Abs(omegaAxis) > Mathf.Max(1e-4f, brakeDeadbandOmega))
-                tau += -Mathf.Sign(omegaAxis) * tauBMax;
-            else
-                tau += Mathf.Clamp(-omegaAxis * brakeHoldK, -tauBMax, tauBMax);
+            if (Mathf.Abs(omegaAxis) > 1e-5f)
+            {
+                // Never allow the brake to reverse wheel spin in one physics
+                // step. The old low-speed spring changed sign each frame,
+                // producing axle chatter and repeatedly invalidating contact.
+                float wheelInertia = GetInertiaAroundWorldAxis(driveAxis);
+                float stopTorque = wheelInertia > 1e-6f
+                    ? wheelInertia * Mathf.Abs(omegaAxis) / Mathf.Max(1e-5f, dt)
+                    : tauBMax;
+                tauBrake = -Mathf.Sign(omegaAxis) * Mathf.Min(tauBMax, stopTorque);
+            }
         }
 
-        // A5: never pump the wheel past the spin cap; braking stays unlimited.
-        // The cap guards PhysX/joint stability, so it uses ABSOLUTE spin.
-        tau = ClampSpinPumpingTorque(tau, omegaAxisAbs, driveAxis, dt);
-        pendingDriveAxisTorque = tau;
+        float tauDissipative = tauCoast + tauBrake;
+        if (tauDissipative * omegaAxis < 0f)
+        {
+            float wheelInertia = GetInertiaAroundWorldAxis(driveAxis);
+            if (wheelInertia > 1e-6f)
+            {
+                float stopTorque = wheelInertia * Mathf.Abs(omegaAxis)
+                                 / Mathf.Max(1e-5f, dt);
+                tauDissipative = Mathf.Clamp(tauDissipative, -stopTorque, stopTorque);
+            }
+        }
+        float tau = tauDrive + tauDissipative;
+        pendingDriveAxisTorque = tauDrive;
         pendingDriveAxisWorld = driveAxis;
         if (Mathf.Abs(tau) > 1e-6f)
             Rigidbody.AddTorque(driveAxis * tau, ForceMode.Force);
@@ -141,49 +202,137 @@ public partial class RubberTireWheelScript
 
     internal float EvaluateEngineTorque(float engineRpm)
     {
-        float peakTorque = Mathf.Max(0f, enginePeakTorque);
-        float peakPower = Mathf.Max(0f, enginePeakPower);
-        if (peakTorque <= 1e-6f || peakPower <= 1e-6f) return 0f;
-
-        // T and P are independent controls. Their physically required
-        // crossover is derived rather than exposed as a redundant parameter.
-        float baseRpm, powerHoldRpm, redlineRpm;
-        GetEngineCurveBreakpoints(out baseRpm, out powerHoldRpm, out redlineRpm);
         float rpm = Mathf.Max(0f, engineRpm);
-        if (rpm >= redlineRpm) return 0f;
+        if (rpm >= Mathf.Max(1f, engineRedlineRpm)) return 0f;
+        if (!EnsureEngineTorqueLut()) return Mathf.Max(0f, enginePeakTorque);
+        if (rpm <= engineLutRpm[0]) return Mathf.Max(0f, engineLutTorque[0]);
 
-        float torqueRiseRpm = Mathf.Max(1f, baseRpm * EngineTorqueRiseBaseFraction);
-        if (rpm < torqueRiseRpm)
+        for (int i = 1; i < engineLutPointCount; i++)
         {
-            float u = SmoothStep01(rpm / torqueRiseRpm);
-            return Mathf.Lerp(
-                peakTorque * EngineZeroSpeedTorqueRatio,
-                peakTorque,
-                u);
+            if (rpm > engineLutRpm[i]) continue;
+            float span = Mathf.Max(1e-4f, engineLutRpm[i] - engineLutRpm[i - 1]);
+            float u = Mathf.Clamp01((rpm - engineLutRpm[i - 1]) / span);
+            return Mathf.Max(0f, Mathf.Lerp(engineLutTorque[i - 1], engineLutTorque[i], u));
         }
-
-        if (rpm <= baseRpm)
-            return peakTorque;
-
-        float omega = Mathf.Max(1e-4f, rpm * RadPerSecondPerRpm);
-        if (rpm <= powerHoldRpm)
-            return peakPower / omega;
-
-        float falloff = 1f - SmoothStep01(
-            (rpm - powerHoldRpm)
-            / Mathf.Max(1f, redlineRpm - powerHoldRpm));
-        return peakPower * falloff / omega;
+        return Mathf.Max(0f, engineLutTorque[engineLutPointCount - 1]);
     }
 
     // C5: single source of truth for the curve breakpoints; the factory UI
     // draws its markers from the same values the torque evaluation uses.
     internal void GetEngineCurveBreakpoints(out float baseRpm, out float powerHoldRpm, out float redlineRpm)
     {
-        float peakTorque = Mathf.Max(1e-6f, enginePeakTorque);
-        float peakPower = Mathf.Max(0f, enginePeakPower);
-        baseRpm = Mathf.Max(1f, peakPower / peakTorque * RpmPerRadPerSecond);
-        powerHoldRpm = Mathf.Max(baseRpm, enginePowerHoldRpm);
-        redlineRpm = Mathf.Max(powerHoldRpm + 1f, engineRedlineRpm);
+        baseRpm = 0f;
+        powerHoldRpm = 0f;
+        redlineRpm = Mathf.Max(1f, engineRedlineRpm);
+    }
+
+    private void UpdateEngineLimiter(float rpm)
+    {
+        float limiter = Mathf.Max(1f, engineRedlineRpm);
+        float resetRpm = limiter - Mathf.Max(1f, engineLimiterHysteresisRpm);
+        if (rpm >= limiter) engineLimiterCut = true;
+        else if (rpm <= resetRpm) engineLimiterCut = false;
+    }
+
+    private bool EnsureEngineTorqueLut()
+    {
+        string source = engineTorqueLut ?? String.Empty;
+        if (String.Equals(source, parsedEngineTorqueLut, StringComparison.Ordinal))
+            return engineLutPointCount >= 2;
+
+        parsedEngineTorqueLut = source;
+        engineLutPointCount = 0;
+        string normalized = source.Replace("\r", "\n").Replace(';', '\n');
+        string[] lines = normalized.Split(new char[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        for (int i = 0; i < lines.Length && engineLutPointCount < MaximumEngineLutPoints; i++)
+        {
+            string line = lines[i].Trim();
+            if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
+            int separator = line.IndexOf('|');
+            if (separator <= 0 || separator >= line.Length - 1) continue;
+            float rpm;
+            float torque;
+            if (!float.TryParse(line.Substring(0, separator).Trim(), NumberStyles.Float,
+                    CultureInfo.InvariantCulture, out rpm)) continue;
+            if (!float.TryParse(line.Substring(separator + 1).Trim(), NumberStyles.Float,
+                    CultureInfo.InvariantCulture, out torque)) continue;
+            if (rpm < 0f || torque < 0f) continue;
+
+            int insert = engineLutPointCount;
+            while (insert > 0 && rpm < engineLutRpm[insert - 1])
+            {
+                engineLutRpm[insert] = engineLutRpm[insert - 1];
+                engineLutTorque[insert] = engineLutTorque[insert - 1];
+                insert--;
+            }
+            engineLutRpm[insert] = rpm;
+            engineLutTorque[insert] = torque;
+            engineLutPointCount++;
+        }
+        return engineLutPointCount >= 2;
+    }
+
+    internal bool FactorySetEngineTorqueLut(string text, out string error)
+    {
+        string previous = engineTorqueLut;
+        engineTorqueLut = text ?? String.Empty;
+        parsedEngineTorqueLut = null;
+        if (EnsureEngineTorqueLut())
+        {
+            error = engineLutPointCount + " points loaded";
+            return true;
+        }
+
+        engineTorqueLut = previous;
+        parsedEngineTorqueLut = null;
+        EnsureEngineTorqueLut();
+        error = "Need at least two valid RPM|Nm rows";
+        return false;
+    }
+
+    internal string FactoryGetEngineTorqueLut() { return engineTorqueLut ?? String.Empty; }
+    internal int FactoryEngineLutPointCount() { EnsureEngineTorqueLut(); return engineLutPointCount; }
+    internal void FactoryEngineLutPoint(int index, out float rpm, out float torque)
+    {
+        EnsureEngineTorqueLut();
+        if (index < 0 || index >= engineLutPointCount)
+        {
+            rpm = 0f;
+            torque = 0f;
+            return;
+        }
+        rpm = engineLutRpm[index];
+        torque = engineLutTorque[index];
+    }
+
+    internal bool FactoryMoveEngineLutPoint(int index, float rpm, float torque)
+    {
+        if (!EnsureEngineTorqueLut() || index < 0 || index >= engineLutPointCount)
+            return false;
+
+        float lower = index > 0 ? engineLutRpm[index - 1] + 25f : 0f;
+        float upper = index + 1 < engineLutPointCount
+            ? engineLutRpm[index + 1] - 25f
+            : Mathf.Max(lower, engineRedlineRpm);
+        if (upper < lower) upper = lower;
+        engineLutRpm[index] = Mathf.Clamp(rpm, lower, upper);
+        engineLutTorque[index] = Mathf.Clamp(torque, 0f, 50000f);
+        RebuildEngineTorqueLutText();
+        return true;
+    }
+
+    private void RebuildEngineTorqueLutText()
+    {
+        StringBuilder builder = new StringBuilder(engineLutPointCount * 18);
+        for (int i = 0; i < engineLutPointCount; i++)
+        {
+            if (i > 0) builder.Append('\n');
+            builder.Append(engineLutRpm[i].ToString("0.##", CultureInfo.InvariantCulture));
+            builder.Append('|');
+            builder.Append(engineLutTorque[i].ToString("0.##", CultureInfo.InvariantCulture));
+        }
+        engineTorqueLut = builder.ToString();
+        parsedEngineTorqueLut = engineTorqueLut;
     }
 
     private float SmoothStep01(float value)
@@ -226,6 +375,22 @@ public partial class RubberTireWheelScript
         currentGear = ClampGear(currentGear, count);
         return Mathf.Max(0.05f, GetGearRatio(currentGear));
     }
+
+    private float GetCurrentTotalDriveRatio()
+    {
+        return Mathf.Max(0.01f, GetCurrentGearRatio())
+            * Mathf.Max(0.01f, finalDriveRatio);
+    }
+
+    internal float FactoryGearWheelOmegaLimit(int gear)
+    {
+        float ratio = (enableGearbox ? Mathf.Max(0.01f, GetGearRatio(gear)) : 1f)
+            * Mathf.Max(0.01f, finalDriveRatio);
+        return Mathf.Min(GetSpinCap(), Mathf.Max(1f, engineRedlineRpm) / (ratio * RpmPerRadPerSecond));
+    }
+
+    internal float FactoryCurrentTotalDriveRatio() { return GetCurrentTotalDriveRatio(); }
+    internal bool FactoryLimiterCut() { return engineLimiterCut; }
 
     private float GetGearRatio(int gear)
     {

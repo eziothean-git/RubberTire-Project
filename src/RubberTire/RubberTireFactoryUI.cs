@@ -56,6 +56,38 @@ internal sealed class RubberTireRowHover : MonoBehaviour, IPointerEnterHandler, 
     }
 }
 
+// The game cameras poll Input.GetAxis("Mouse ScrollWheel") directly, so merely
+// consuming an EventSystem scroll event cannot stop world zoom.  Tell the
+// controller when the pointer is anywhere over the lab and temporarily mute
+// only the cameras' zoom sensitivity.
+internal sealed class RubberTireUiCameraGuard : MonoBehaviour,
+    IPointerEnterHandler, IPointerExitHandler, IScrollHandler
+{
+    internal RubberTireFactoryUIController Controller;
+
+    public void OnPointerEnter(PointerEventData eventData)
+    {
+        if (Controller != null) Controller.SetPointerOverLab(true);
+    }
+
+    public void OnPointerExit(PointerEventData eventData)
+    {
+        if (Controller != null) Controller.SetPointerOverLab(false);
+    }
+
+    public void OnScroll(PointerEventData eventData)
+    {
+        // Child ScrollRects still receive and process their own scroll event.
+        // Use() prevents unrelated event-driven consumers from seeing it.
+        if (eventData != null) eventData.Use();
+    }
+
+    private void OnDisable()
+    {
+        if (Controller != null) Controller.SetPointerOverLab(false);
+    }
+}
+
 public sealed class RubberTireFactoryUIController : MonoBehaviour
 {
     private static readonly string[] Tabs =
@@ -66,6 +98,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
 
     private GameObject root;
     private RectTransform settingsContent;
+    private ScrollRect settingsScroll;
     private Text chartTitle;
     private Text chartLegend;
     private Text chartLive;
@@ -75,6 +108,21 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
     private Text chartAxisX;
     private Text tooltipLabel;
     private Text advancedButtonText;
+    private Text groupButtonText;
+    private Button engineLutToggleButton;
+    private Text engineLutToggleText;
+    private GameObject engineLutEditorRoot;
+    private InputField engineLutInput;
+    private Text engineLutStatus;
+    private bool engineLutEditorVisible;
+    private string focusedGroupKey;
+    private bool pointerOverLab;
+    private OrbitCamera[] guardedOrbitCameras;
+    private float[] guardedOrbitZoomSpeeds;
+    private MouseOrbit[] guardedMouseOrbits;
+    private float[] guardedMouseOrbitScrollSpeeds;
+    private ScrollToZoom[] guardedScrollZooms;
+    private float[] guardedScrollZoomSpeeds;
     private RubberTireCurveGraphic chart;
     private RubberTireWheelScript target;
     private RubberTireWheelScript simTarget;
@@ -143,6 +191,8 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
                 RefreshBindings();
                 ApplyRowVisibility();
                 UpdateChartTexts();
+                if (engineLutEditorVisible && engineLutInput != null)
+                    engineLutInput.text = target.FactoryGetEngineTorqueLut();
             }
         }
 
@@ -198,6 +248,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         simTarget = null;
         chart = null;
         settingsContent = null;
+        settingsScroll = null;
         chartTitle = null;
         chartLegend = null;
         chartLive = null;
@@ -207,6 +258,15 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         chartAxisX = null;
         tooltipLabel = null;
         advancedButtonText = null;
+        groupButtonText = null;
+        engineLutToggleButton = null;
+        engineLutToggleText = null;
+        engineLutEditorRoot = null;
+        engineLutInput = null;
+        engineLutStatus = null;
+        engineLutEditorVisible = false;
+        focusedGroupKey = null;
+        RestoreCameraZoom();
         tabButtons.Clear();
         rows.Clear();
         headers.Clear();
@@ -241,6 +301,8 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         if (labGroup == null) labGroup = root.AddComponent<CanvasGroup>();
         labGroup.interactable = true;
         labGroup.blocksRaycasts = true;
+        RubberTireUiCameraGuard cameraGuard = root.AddComponent<RubberTireUiCameraGuard>();
+        cameraGuard.Controller = this;
         root.transform.SetAsLastSibling();
 
         CreateText(root.transform, "RUBBER TIRE LAB", 22, FontStyle.Bold,
@@ -266,7 +328,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
             "Settings Viewport",
             root.transform,
             new Vector2(18f, -102f),
-            new Vector2(330f, 440f));
+            new Vector2(330f, 408f));
         Image viewportImage = viewport.gameObject.AddComponent<Image>();
         viewportImage.color = new Color(0.025f, 0.03f, 0.035f, 0.75f);
         Mask mask = viewport.gameObject.AddComponent<Mask>();
@@ -291,13 +353,18 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         ContentSizeFitter fitter = settingsContent.gameObject.AddComponent<ContentSizeFitter>();
         fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
 
-        ScrollRect scroll = viewport.gameObject.AddComponent<ScrollRect>();
-        scroll.content = settingsContent;
-        scroll.viewport = viewport;
-        scroll.horizontal = false;
-        scroll.vertical = true;
-        scroll.movementType = ScrollRect.MovementType.Clamped;
-        scroll.scrollSensitivity = 28f;
+        settingsScroll = viewport.gameObject.AddComponent<ScrollRect>();
+        settingsScroll.content = settingsContent;
+        settingsScroll.viewport = viewport;
+        settingsScroll.horizontal = false;
+        settingsScroll.vertical = true;
+        settingsScroll.movementType = ScrollRect.MovementType.Clamped;
+        settingsScroll.scrollSensitivity = 28f;
+
+        Button groupButton = CreateButton(root.transform, "Group: All",
+            new Vector2(18f, -518f), new Vector2(330f, 26f));
+        groupButtonText = groupButton.GetComponentInChildren<Text>();
+        groupButton.onClick.AddListener(CycleFocusedGroup);
 
         // E3/E4: workspace actions under the settings list.
         Button resetButton = CreateButton(root.transform, "Reset Tab",
@@ -342,6 +409,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
             new Vector2(460f, 386f));
         chart = chartRect.gameObject.AddComponent<RubberTireCurveGraphic>();
         chart.raycastTarget = false;
+        chart.OnEngineCurveEdited = OnEngineCurveDragged;
 
         // E6: numeric context for the mesh-only chart.
         chartAxisLeft = CreateText(chartPanel, "", 11, FontStyle.Normal,
@@ -357,6 +425,15 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
 
         contactLive = CreateText(chartPanel, "", 12, FontStyle.Normal,
             new Vector2(18f, -96f), new Vector2(440f, 360f), TextAnchor.UpperLeft, Color.white);
+
+        engineLutToggleButton = CreateButton(chartPanel, "Edit RPM|Nm",
+            new Vector2(368f, -8f), new Vector2(110f, 28f));
+        engineLutToggleText = engineLutToggleButton.GetComponentInChildren<Text>();
+        engineLutToggleButton.onClick.AddListener(delegate
+        {
+            SetEngineLutEditorVisible(!engineLutEditorVisible);
+        });
+        CreateEngineLutEditor(chartPanel);
 
         root.SetActive(false);
         SelectTab(activeTab);
@@ -392,9 +469,75 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         return null;
     }
 
+    private void CreateEngineLutEditor(Transform parent)
+    {
+        RectTransform editor = CreateRectObject("Engine LUT Editor", parent,
+            new Vector2(18f, -78f), new Vector2(460f, 398f));
+        engineLutEditorRoot = editor.gameObject;
+        Image background = editor.gameObject.AddComponent<Image>();
+        background.color = new Color(0.025f, 0.03f, 0.035f, 0.995f);
+
+        CreateText(editor, "Assetto Corsa style: one RPM|TORQUE_NM point per line",
+            12, FontStyle.Normal, new Vector2(10f, -8f), new Vector2(440f, 22f),
+            TextAnchor.MiddleLeft, MutedColor);
+        engineLutInput = CreateMultilineInput(editor,
+            new Vector2(10f, -36f), new Vector2(440f, 288f));
+
+        Button apply = CreateButton(editor, "Apply LUT",
+            new Vector2(10f, -334f), new Vector2(110f, 28f));
+        apply.onClick.AddListener(ApplyEngineLutEditor);
+        Button defaults = CreateButton(editor, "Default",
+            new Vector2(128f, -334f), new Vector2(100f, 28f));
+        defaults.onClick.AddListener(delegate
+        {
+            if (engineLutInput != null) engineLutInput.text = RubberTireWheelScript.DefaultEngineTorqueLut;
+            ApplyEngineLutEditor();
+        });
+        Button close = CreateButton(editor, "Curve",
+            new Vector2(236f, -334f), new Vector2(96f, 28f));
+        close.onClick.AddListener(delegate { SetEngineLutEditorVisible(false); });
+        engineLutStatus = CreateText(editor, "", 11, FontStyle.Normal,
+            new Vector2(10f, -368f), new Vector2(440f, 22f),
+            TextAnchor.MiddleLeft, AccentColor);
+        engineLutEditorRoot.SetActive(false);
+    }
+
+    private void SetEngineLutEditorVisible(bool visible)
+    {
+        engineLutEditorVisible = visible && activeTab == "Engine";
+        if (engineLutEditorRoot != null) engineLutEditorRoot.SetActive(engineLutEditorVisible);
+        if (chart != null) chart.raycastTarget = activeTab == "Engine" && !engineLutEditorVisible;
+        if (engineLutToggleText != null)
+            engineLutToggleText.text = engineLutEditorVisible ? "Curve" : "Edit RPM|Nm";
+        if (engineLutEditorVisible && engineLutInput != null && target != null)
+        {
+            engineLutInput.text = target.FactoryGetEngineTorqueLut();
+            if (engineLutStatus != null) engineLutStatus.text = "";
+        }
+    }
+
+    private void ApplyEngineLutEditor()
+    {
+        if (target == null || engineLutInput == null) return;
+        string status;
+        bool valid = target.FactorySetEngineTorqueLut(engineLutInput.text, out status);
+        if (engineLutStatus != null)
+        {
+            engineLutStatus.color = valid ? AccentColor : new Color(1f, 0.35f, 0.28f, 1f);
+            engineLutStatus.text = status;
+        }
+        if (!valid) return;
+        OnSettingChanged();
+        UpdateChartTexts();
+        if (chart != null) chart.SetVerticesDirty();
+    }
+
     private void SelectTab(string tab)
     {
         activeTab = tab;
+        focusedGroupKey = null;
+        UpdateGroupButton();
+        if (settingsScroll != null) settingsScroll.verticalNormalizedPosition = 1f;
         for (int i = 0; i < tabButtons.Count; i++)
         {
             Image image = tabButtons[i].GetComponent<Image>();
@@ -412,11 +555,14 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
     private void UpdateChartMode()
     {
         if (chart == null) return;
+        if (engineLutToggleButton != null)
+            engineLutToggleButton.gameObject.SetActive(activeTab == "Engine");
+        if (activeTab != "Engine") SetEngineLutEditorVisible(false);
         if (activeTab == "Engine")
         {
             chart.Kind = RubberTireChartKind.Engine;
             chartTitle.text = "ENGINE TORQUE / POWER";
-            chartLegend.text = "CYAN torque    ORANGE power    WHITE live RPM    thin verticals: base / hold";
+            chartLegend.text = "CYAN RPM|Nm LUT (drag white points)    ORANGE power    WHITE live RPM";
         }
         else if (activeTab == "Tire")
         {
@@ -439,6 +585,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
                 : "These controls affect diagnostics only; physical parameters live in the other pages.";
         }
         if (contactLive != null && activeTab != "Contact") contactLive.text = "";
+        chart.raycastTarget = activeTab == "Engine" && !engineLutEditorVisible;
         chart.SetVerticesDirty();
     }
 
@@ -487,6 +634,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
                 ? CreateToggleRow(setting, groupKey)
                 : CreateFloatRow(setting, groupKey));
         }
+        UpdateGroupButton();
     }
 
     private void CreateGroupHeader(string group, string groupKey)
@@ -653,6 +801,55 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         if (chart != null) chart.SetVerticesDirty();
     }
 
+    private void OnEngineCurveDragged()
+    {
+        if (target == null) return;
+        if (engineLutInput != null)
+            engineLutInput.text = target.FactoryGetEngineTorqueLut();
+        if (engineLutStatus != null)
+        {
+            engineLutStatus.color = AccentColor;
+            engineLutStatus.text = "Curve point moved";
+        }
+        OnSettingChanged();
+        UpdateChartTexts();
+    }
+
+    private void CycleFocusedGroup()
+    {
+        List<string> keys = new List<string>(8);
+        for (int i = 0; i < headers.Count; i++)
+        {
+            string key = headers[i].GroupKey;
+            if (key.StartsWith(activeTab + "/", StringComparison.Ordinal)) keys.Add(key);
+        }
+
+        if (keys.Count == 0) focusedGroupKey = null;
+        else if (String.IsNullOrEmpty(focusedGroupKey)) focusedGroupKey = keys[0];
+        else
+        {
+            int index = keys.IndexOf(focusedGroupKey);
+            focusedGroupKey = index >= 0 && index + 1 < keys.Count ? keys[index + 1] : null;
+        }
+        UpdateGroupButton();
+        ApplyRowVisibility();
+        if (settingsScroll != null) settingsScroll.verticalNormalizedPosition = 1f;
+    }
+
+    private void UpdateGroupButton()
+    {
+        if (groupButtonText == null) return;
+        if (String.IsNullOrEmpty(focusedGroupKey))
+        {
+            groupButtonText.text = "Group: All  >";
+            return;
+        }
+        RubberTireGroupHeader header;
+        groupButtonText.text = headersByKey.TryGetValue(focusedGroupKey, out header)
+            ? "Group: " + header.Group + "  >"
+            : "Group: All  >";
+    }
+
     private void ResetActiveTab()
     {
         if (target == null) return;
@@ -742,6 +939,8 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
             RubberTireSettingRow row = rows[i];
             RubberTireFactorySetting setting = row.Setting;
             bool pass = String.Equals(setting.Tab, activeTab, StringComparison.Ordinal)
+                && (String.IsNullOrEmpty(focusedGroupKey)
+                    || String.Equals(row.GroupKey, focusedGroupKey, StringComparison.Ordinal))
                 && (!setting.Advanced || showAdvanced)
                 && (setting.VisibleWhen == null || setting.VisibleWhen());
             if (pass)
@@ -794,8 +993,9 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
             }
             chartAxisLeft.text = "T max " + maxTorque.ToString("0") + " Nm";
             chartAxisRight.text = "P max " + (maxPower / 1000f).ToString("0.#") + " kW";
-            chartAxisX.text = "0 - " + redlineRpm.ToString("0") + " RPM  (base "
-                + baseRpm.ToString("0") + ", hold " + holdRpm.ToString("0") + ")";
+            chartAxisX.text = "0 - " + redlineRpm.ToString("0")
+                + " RPM  |  final " + target.FactoryCurrentTotalDriveRatio().ToString("0.###")
+                + " total ratio in current gear";
         }
         else if (chart.Kind == RubberTireChartKind.Support)
         {
@@ -837,7 +1037,11 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
             chartLive.text = "GEAR " + target.FactoryCurrentGear()
                 + "   THR " + Mathf.RoundToInt(target.FactoryThrottle01() * 100f) + "%"
                 + "   BRK " + Mathf.RoundToInt(target.FactoryBrake01() * 100f) + "%"
-                + "   RPM " + Mathf.Max(0f, target.FactoryCurrentEngineRpm()).ToString("0");
+                + "   RPM " + Mathf.Max(0f, target.FactoryCurrentEngineRpm()).ToString("0")
+                + (target.FactoryLimiterCut() ? "   LIMIT" : "")
+                + "   gear cap "
+                + target.FactoryGearWheelOmegaLimit(target.FactoryCurrentGear()).ToString("0.0")
+                + " rad/s";
         }
         else if (chart.Kind == RubberTireChartKind.Tire)
         {
@@ -989,6 +1193,33 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         return input;
     }
 
+    private InputField CreateMultilineInput(Transform parent, Vector2 topLeft, Vector2 size)
+    {
+        RectTransform rect = CreateRectObject("LUT Text", parent, topLeft, size);
+        Image background = rect.gameObject.AddComponent<Image>();
+        background.color = new Color(0.01f, 0.012f, 0.015f, 1f);
+        background.raycastTarget = true;
+
+        Text valueText = CreateText(rect, "", 13, FontStyle.Normal,
+            new Vector2(8f, -6f), new Vector2(size.x - 16f, size.y - 12f),
+            TextAnchor.UpperLeft, Color.white);
+        valueText.name = "Text";
+        valueText.supportRichText = false;
+        valueText.horizontalOverflow = HorizontalWrapMode.Wrap;
+        valueText.verticalOverflow = VerticalWrapMode.Truncate;
+
+        InputField input = rect.gameObject.AddComponent<InputField>();
+        input.targetGraphic = background;
+        input.textComponent = valueText;
+        input.contentType = InputField.ContentType.Standard;
+        input.lineType = InputField.LineType.MultiLineNewline;
+        input.interactable = true;
+        Navigation navigation = input.navigation;
+        navigation.mode = Navigation.Mode.None;
+        input.navigation = navigation;
+        return input;
+    }
+
     // =========================
     // Shared helpers
     // =========================
@@ -1080,16 +1311,96 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         return buttonObject.GetComponent<Button>();
     }
 
+    internal void SetPointerOverLab(bool over)
+    {
+        if (pointerOverLab == over) return;
+        pointerOverLab = over;
+        if (over) MuteCameraZoom();
+        else RestoreCameraZoom();
+    }
+
+    private void MuteCameraZoom()
+    {
+        RestoreCameraZoom();
+        pointerOverLab = true;
+
+        guardedOrbitCameras = UnityEngine.Object.FindObjectsOfType<OrbitCamera>();
+        guardedOrbitZoomSpeeds = new float[guardedOrbitCameras.Length];
+        for (int i = 0; i < guardedOrbitCameras.Length; i++)
+        {
+            if (guardedOrbitCameras[i] == null) continue;
+            guardedOrbitZoomSpeeds[i] = guardedOrbitCameras[i].zoomSpeed;
+            guardedOrbitCameras[i].zoomSpeed = 0f;
+        }
+
+        guardedMouseOrbits = UnityEngine.Object.FindObjectsOfType<MouseOrbit>();
+        guardedMouseOrbitScrollSpeeds = new float[guardedMouseOrbits.Length];
+        for (int i = 0; i < guardedMouseOrbits.Length; i++)
+        {
+            if (guardedMouseOrbits[i] == null) continue;
+            guardedMouseOrbitScrollSpeeds[i] = guardedMouseOrbits[i].scrollSensitivityScaler;
+            guardedMouseOrbits[i].scrollSensitivityScaler = 0f;
+        }
+
+        guardedScrollZooms = UnityEngine.Object.FindObjectsOfType<ScrollToZoom>();
+        guardedScrollZoomSpeeds = new float[guardedScrollZooms.Length];
+        for (int i = 0; i < guardedScrollZooms.Length; i++)
+        {
+            if (guardedScrollZooms[i] == null) continue;
+            guardedScrollZoomSpeeds[i] = guardedScrollZooms[i].speed;
+            guardedScrollZooms[i].speed = 0f;
+        }
+    }
+
+    private void RestoreCameraZoom()
+    {
+        pointerOverLab = false;
+        if (guardedOrbitCameras != null && guardedOrbitZoomSpeeds != null)
+        {
+            int count = Mathf.Min(guardedOrbitCameras.Length, guardedOrbitZoomSpeeds.Length);
+            for (int i = 0; i < count; i++)
+                if (guardedOrbitCameras[i] != null)
+                    guardedOrbitCameras[i].zoomSpeed = guardedOrbitZoomSpeeds[i];
+        }
+        if (guardedMouseOrbits != null && guardedMouseOrbitScrollSpeeds != null)
+        {
+            int count = Mathf.Min(guardedMouseOrbits.Length, guardedMouseOrbitScrollSpeeds.Length);
+            for (int i = 0; i < count; i++)
+                if (guardedMouseOrbits[i] != null)
+                    guardedMouseOrbits[i].scrollSensitivityScaler = guardedMouseOrbitScrollSpeeds[i];
+        }
+        if (guardedScrollZooms != null && guardedScrollZoomSpeeds != null)
+        {
+            int count = Mathf.Min(guardedScrollZooms.Length, guardedScrollZoomSpeeds.Length);
+            for (int i = 0; i < count; i++)
+                if (guardedScrollZooms[i] != null)
+                    guardedScrollZooms[i].speed = guardedScrollZoomSpeeds[i];
+        }
+        guardedOrbitCameras = null;
+        guardedOrbitZoomSpeeds = null;
+        guardedMouseOrbits = null;
+        guardedMouseOrbitScrollSpeeds = null;
+        guardedScrollZooms = null;
+        guardedScrollZoomSpeeds = null;
+    }
+
     private void OnDestroy()
     {
+        RestoreCameraZoom();
         if (root != null) Destroy(root);
     }
 }
 
-public sealed class RubberTireCurveGraphic : MaskableGraphic
+public sealed class RubberTireCurveGraphic : MaskableGraphic,
+    IPointerDownHandler, IBeginDragHandler, IDragHandler, IEndDragHandler
 {
     public RubberTireWheelScript Target;
     public RubberTireChartKind Kind;
+    public Action OnEngineCurveEdited;
+
+    private int draggedPoint = -1;
+    private float engineEditorMaxRpm = 1f;
+    private float engineEditorTorqueScale = 1f;
 
     private static readonly Color GridColor = new Color(0.28f, 0.32f, 0.35f, 0.36f);
     private static readonly Color MarkerColor = new Color(0.55f, 0.62f, 0.68f, 0.55f);
@@ -1150,9 +1461,15 @@ public sealed class RubberTireCurveGraphic : MaskableGraphic
             maxTorque = Mathf.Max(maxTorque, torque);
             maxPower = Mathf.Max(maxPower, power);
         }
+        engineEditorMaxRpm = maxRpm;
+        // Keep some vertical headroom so the highest key can be dragged upward
+        // as well as down. Releasing and dragging again expands it further.
+        engineEditorTorqueScale = Mathf.Max(1f, maxTorque * 1.15f);
 
-        AddLine(vh, Plot(r, baseRpm / maxRpm, 0f), Plot(r, baseRpm / maxRpm, 1f), 1f, MarkerColor);
-        AddLine(vh, Plot(r, holdRpm / maxRpm, 0f), Plot(r, holdRpm / maxRpm, 1f), 1f, MarkerColor);
+        if (baseRpm > 0f)
+            AddLine(vh, Plot(r, baseRpm / maxRpm, 0f), Plot(r, baseRpm / maxRpm, 1f), 1f, MarkerColor);
+        if (holdRpm > 0f)
+            AddLine(vh, Plot(r, holdRpm / maxRpm, 0f), Plot(r, holdRpm / maxRpm, 1f), 1f, MarkerColor);
 
         Vector2 previousTorque = Vector2.zero;
         Vector2 previousPower = Vector2.zero;
@@ -1162,7 +1479,7 @@ public sealed class RubberTireCurveGraphic : MaskableGraphic
             float rpm = maxRpm * u;
             float torque, power;
             Target.FactoryEnginePoint(rpm, out torque, out power);
-            Vector2 torquePoint = Plot(r, u, torque / maxTorque);
+            Vector2 torquePoint = Plot(r, u, torque / engineEditorTorqueScale);
             Vector2 powerPoint = Plot(r, u, power / maxPower);
             if (i > 0)
             {
@@ -1173,12 +1490,82 @@ public sealed class RubberTireCurveGraphic : MaskableGraphic
             previousPower = powerPoint;
         }
 
+        int pointCount = Target.FactoryEngineLutPointCount();
+        for (int i = 0; i < pointCount; i++)
+        {
+            float pointRpm;
+            float pointTorque;
+            Target.FactoryEngineLutPoint(i, out pointRpm, out pointTorque);
+            Vector2 point = Plot(r,
+                Mathf.Clamp01(pointRpm / maxRpm),
+                Mathf.Clamp01(pointTorque / engineEditorTorqueScale));
+            AddLine(vh, point + new Vector2(-4f, 0f), point + new Vector2(4f, 0f), 2f, White);
+            AddLine(vh, point + new Vector2(0f, -4f), point + new Vector2(0f, 4f), 2f, White);
+        }
+
         float liveRpm = Target.FactoryCurrentEngineRpm();
         if (liveRpm >= 0f)
         {
             float u = Mathf.Clamp01(liveRpm / maxRpm);
             AddLine(vh, Plot(r, u, 0f), Plot(r, u, 1f), 2f, White);
         }
+    }
+
+    public void OnPointerDown(PointerEventData eventData)
+    {
+        if (eventData == null || Target == null || Kind != RubberTireChartKind.Engine) return;
+        Vector2 local;
+        if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                rectTransform, eventData.position, eventData.pressEventCamera, out local)) return;
+
+        Rect r = rectTransform.rect;
+        int best = -1;
+        float bestDistance = 18f * 18f;
+        int count = Target.FactoryEngineLutPointCount();
+        for (int i = 0; i < count; i++)
+        {
+            float rpm;
+            float torque;
+            Target.FactoryEngineLutPoint(i, out rpm, out torque);
+            Vector2 point = Plot(r,
+                rpm / Mathf.Max(1f, engineEditorMaxRpm),
+                torque / Mathf.Max(1f, engineEditorTorqueScale));
+            float distance = (point - local).sqrMagnitude;
+            if (distance > bestDistance) continue;
+            best = i;
+            bestDistance = distance;
+        }
+        draggedPoint = best;
+        if (draggedPoint >= 0) eventData.Use();
+    }
+
+    public void OnBeginDrag(PointerEventData eventData)
+    {
+        if (draggedPoint >= 0 && eventData != null) eventData.Use();
+    }
+
+    public void OnDrag(PointerEventData eventData)
+    {
+        if (draggedPoint < 0 || eventData == null || Target == null) return;
+        Vector2 local;
+        if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                rectTransform, eventData.position, eventData.pressEventCamera, out local)) return;
+        Rect r = rectTransform.rect;
+        float u = Mathf.Clamp01((local.x - r.xMin) / Mathf.Max(1f, r.width));
+        float v = Mathf.Clamp01((local.y - r.yMin) / Mathf.Max(1f, r.height));
+        if (Target.FactoryMoveEngineLutPoint(
+                draggedPoint, u * engineEditorMaxRpm, v * engineEditorTorqueScale))
+        {
+            SetVerticesDirty();
+            if (OnEngineCurveEdited != null) OnEngineCurveEdited();
+        }
+        eventData.Use();
+    }
+
+    public void OnEndDrag(PointerEventData eventData)
+    {
+        draggedPoint = -1;
+        if (eventData != null) eventData.Use();
     }
 
     private void DrawTire(VertexHelper vh, Rect r)

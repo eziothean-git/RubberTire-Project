@@ -230,6 +230,8 @@ public partial class RubberTireWheelScript : BlockScript
         currentGear = 1;
         throttle01 = 0f;
         brake01 = 0f;
+        engineLimiterCut = false;
+        currentEngineRpm = 0f;
         lastStepHadRaycastContact = false;
         jointParentCached = false;
         jointParentBody = null;
@@ -260,6 +262,8 @@ public partial class RubberTireWheelScript : BlockScript
         colStates.Clear();
         throttle01 = 0f;
         brake01 = 0f;
+        engineLimiterCut = false;
+        currentEngineRpm = 0f;
         lastStepHadRaycastContact = false;
         jointParentCached = false;
         jointParentBody = null;

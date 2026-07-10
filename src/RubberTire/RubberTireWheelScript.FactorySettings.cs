@@ -97,6 +97,7 @@ public partial class RubberTireWheelScript
         List<RubberTireFactorySetting> s = new List<RubberTireFactorySetting>(96);
 
         Func<bool> whenEngineCurve = delegate { return enableEngineCurve; };
+        Func<bool> whenConstantEngine = delegate { return !enableEngineCurve; };
         Func<bool> whenGearbox = delegate { return enableGearbox; };
         Func<bool> whenRolling = delegate { return enableRollingDamping; };
         Func<bool> whenCombinedSlip = delegate { return enableCombinedSlipFriction; };
@@ -112,28 +113,30 @@ public partial class RubberTireWheelScript
         // ===== Engine =====
         s.Add(FactoryBool("Engine", "drv", "Drive / brake enabled", delegate { return enableDriveBrake; }, delegate(bool v) { enableDriveBrake = v; }).In("Engine"));
         s.Add(FactoryBool("Engine", "invDrv", "Invert drive torque", delegate { return invertDriveTorque; }, delegate(bool v) { invertDriveTorque = v; }).In("Engine"));
-        s.Add(FactoryBool("Engine", "engCurve", "Torque / power curve", delegate { return enableEngineCurve; }, delegate(bool v) { enableEngineCurve = v; }).In("Engine").Tip("Off = constant peak torque at any RPM"));
-        s.Add(FactoryFloat("Engine", "engT", "Peak torque (N m)", 0f, 50000f, delegate { return enginePeakTorque; }, delegate(float v) { enginePeakTorque = v; }).In("Engine").Curve());
-        s.Add(FactoryFloat("Engine", "engP", "Peak power (W)", 0f, 2000000f, delegate { return enginePeakPower; }, delegate(float v) { enginePeakPower = v; }).In("Engine").Curve().When(whenEngineCurve));
-        s.Add(FactoryFloat("Engine", "engHold", "Power hold RPM", 100f, 20000f, delegate { return enginePowerHoldRpm; }, delegate(float v) { enginePowerHoldRpm = v; }).In("Engine").When(whenEngineCurve).Tip("Constant-power plateau ends here; torque falls to zero at redline"));
-        s.Add(FactoryFloat("Engine", "engRed", "Redline RPM", 200f, 25000f, delegate { return engineRedlineRpm; }, delegate(float v) { engineRedlineRpm = v; }).In("Engine").When(whenEngineCurve));
+        s.Add(FactoryBool("Engine", "engCurve", "AC-style torque LUT", delegate { return enableEngineCurve; }, delegate(bool v) { enableEngineCurve = v; }).In("Engine").Tip("On = interpolate RPM|Nm rows from the curve editor; off = constant torque"));
+        s.Add(FactoryFloat("Engine", "engT", "Constant torque (N m)", 0f, 50000f, delegate { return enginePeakTorque; }, delegate(float v) { enginePeakTorque = v; }).In("Engine").Curve().When(whenConstantEngine));
+        s.Add(FactoryFloat("Engine", "engIdle", "Idle RPM", 0f, 10000f, delegate { return engineIdleRpm; }, delegate(float v) { engineIdleRpm = v; }).In("Engine"));
+        s.Add(FactoryFloat("Engine", "engRed", "Limiter RPM", 200f, 25000f, delegate { return engineRedlineRpm; }, delegate(float v) { engineRedlineRpm = v; }).In("Engine"));
+        s.Add(FactoryFloat("Engine", "engHys", "Limiter hysteresis RPM", 1f, 2000f, delegate { return engineLimiterHysteresisRpm; }, delegate(float v) { engineLimiterHysteresisRpm = v; }).In("Engine").Adv().Tip("Fuel resumes this far below the limiter"));
+        s.Add(FactoryFloat("Engine", "engCoast", "Engine braking (N m)", 0f, 1000f, delegate { return engineCoastTorque; }, delegate(float v) { engineCoastTorque = v; }).In("Engine").Curve().Tip("Closed-throttle coast torque at the crank"));
 
         // ===== Gearbox =====
         s.Add(FactoryBool("Engine", "gbx", "Gearbox", delegate { return enableGearbox; }, delegate(bool v) { enableGearbox = v; }).In("Gearbox"));
         s.Add(FactoryFloat("Engine", "gCnt", "Gear count", 1f, 8f, delegate { return gearCount; }, delegate(float v) { gearCount = Mathf.Round(v); }).In("Gearbox").When(whenGearbox));
-        s.Add(FactoryFloat("Engine", "gR1", "Gear 1 ratio", 0.05f, 10f, delegate { return gearRatio1; }, delegate(float v) { gearRatio1 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 1; }));
-        s.Add(FactoryFloat("Engine", "gR2", "Gear 2 ratio", 0.05f, 10f, delegate { return gearRatio2; }, delegate(float v) { gearRatio2 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 2; }));
-        s.Add(FactoryFloat("Engine", "gR3", "Gear 3 ratio", 0.05f, 10f, delegate { return gearRatio3; }, delegate(float v) { gearRatio3 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 3; }));
-        s.Add(FactoryFloat("Engine", "gR4", "Gear 4 ratio", 0.05f, 10f, delegate { return gearRatio4; }, delegate(float v) { gearRatio4 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 4; }));
-        s.Add(FactoryFloat("Engine", "gR5", "Gear 5 ratio", 0.05f, 10f, delegate { return gearRatio5; }, delegate(float v) { gearRatio5 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 5; }));
-        s.Add(FactoryFloat("Engine", "gR6", "Gear 6 ratio", 0.05f, 10f, delegate { return gearRatio6; }, delegate(float v) { gearRatio6 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 6; }));
-        s.Add(FactoryFloat("Engine", "gR7", "Gear 7 ratio", 0.05f, 10f, delegate { return gearRatio7; }, delegate(float v) { gearRatio7 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 7; }));
-        s.Add(FactoryFloat("Engine", "gR8", "Gear 8 ratio", 0.05f, 10f, delegate { return gearRatio8; }, delegate(float v) { gearRatio8 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 8; }));
+        s.Add(FactoryFloat("Engine", "gFinal", "Final drive ratio", 0.05f, 30f, delegate { return finalDriveRatio; }, delegate(float v) { finalDriveRatio = v; }).In("Gearbox").Tip("Multiplies every gear for both engine RPM and wheel torque; Besiege's large wheels typically need 6-15"));
+        s.Add(FactoryFloat("Engine", "gEff", "Drivetrain efficiency", 0.1f, 1f, delegate { return drivetrainEfficiency; }, delegate(float v) { drivetrainEfficiency = v; }).In("Gearbox").Adv());
+        s.Add(FactoryFloat("Engine", "gR1", "Gear 1 ratio", 0.05f, 20f, delegate { return gearRatio1; }, delegate(float v) { gearRatio1 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 1; }));
+        s.Add(FactoryFloat("Engine", "gR2", "Gear 2 ratio", 0.05f, 20f, delegate { return gearRatio2; }, delegate(float v) { gearRatio2 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 2; }));
+        s.Add(FactoryFloat("Engine", "gR3", "Gear 3 ratio", 0.05f, 20f, delegate { return gearRatio3; }, delegate(float v) { gearRatio3 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 3; }));
+        s.Add(FactoryFloat("Engine", "gR4", "Gear 4 ratio", 0.05f, 20f, delegate { return gearRatio4; }, delegate(float v) { gearRatio4 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 4; }));
+        s.Add(FactoryFloat("Engine", "gR5", "Gear 5 ratio", 0.05f, 20f, delegate { return gearRatio5; }, delegate(float v) { gearRatio5 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 5; }));
+        s.Add(FactoryFloat("Engine", "gR6", "Gear 6 ratio", 0.05f, 20f, delegate { return gearRatio6; }, delegate(float v) { gearRatio6 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 6; }));
+        s.Add(FactoryFloat("Engine", "gR7", "Gear 7 ratio", 0.05f, 20f, delegate { return gearRatio7; }, delegate(float v) { gearRatio7 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 7; }));
+        s.Add(FactoryFloat("Engine", "gR8", "Gear 8 ratio", 0.05f, 20f, delegate { return gearRatio8; }, delegate(float v) { gearRatio8 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 8; }));
 
         // ===== Brakes =====
         s.Add(FactoryFloat("Engine", "brkT", "Maximum brake torque", 0f, 80000f, delegate { return maxBrakeTorque; }, delegate(float v) { maxBrakeTorque = v; }).In("Brakes").Curve());
-        s.Add(FactoryFloat("Engine", "brkDb", "Brake deadband (rad/s)", 0f, 10f, delegate { return brakeDeadbandOmega; }, delegate(float v) { brakeDeadbandOmega = v; }).In("Brakes").Adv().Tip("Below this spin speed the brake holds instead of fighting sign flips"));
-        s.Add(FactoryFloat("Engine", "brkK", "Brake hold gain", 0f, 20000f, delegate { return brakeHoldK; }, delegate(float v) { brakeHoldK = v; }).In("Brakes").Adv().Curve().Tip("Viscous hold torque inside the deadband"));
+        s.Add(FactoryFloat("Engine", "brkDb", "Coast cutoff (rad/s)", 0f, 10f, delegate { return brakeDeadbandOmega; }, delegate(float v) { brakeDeadbandOmega = v; }).In("Brakes").Adv().Tip("Below this speed engine braking stops; service braking uses a non-reversing inertia clamp"));
 
         // ===== Response =====
         s.Add(FactoryFloat("Engine", "thrUp", "Throttle rise (1/s)", 0f, 40f, delegate { return throttleRise; }, delegate(float v) { throttleRise = v; }).In("Response").Adv());
@@ -269,6 +272,9 @@ public partial class RubberTireWheelScript
                 result.Append(setting.GetFloat().ToString("R", CultureInfo.InvariantCulture));
             result.Append('\n');
         }
+        result.Append("engLut64=")
+            .Append(Convert.ToBase64String(Encoding.UTF8.GetBytes(FactoryGetEngineTorqueLut())))
+            .Append('\n');
         return result.ToString();
     }
 
@@ -306,6 +312,17 @@ public partial class RubberTireWheelScript
                         setting.SetFloat(parsed);
                 }
             }
+            string encodedLut;
+            if (values.TryGetValue("engLut64", out encodedLut))
+            {
+                try
+                {
+                    string lut = Encoding.UTF8.GetString(Convert.FromBase64String(encodedLut));
+                    string ignored;
+                    FactorySetEngineTorqueLut(lut, out ignored);
+                }
+                catch (FormatException) { }
+            }
             currentGear = ClampGear(currentGear, GetGearCount());
             factoryLastAppliedConfig = serialized;
         }
@@ -325,6 +342,11 @@ public partial class RubberTireWheelScript
             if (!String.Equals(setting.Tab, tab, StringComparison.Ordinal)) continue;
             if (setting.IsToggle) setting.SetBool(setting.DefaultBool);
             else setting.SetFloat(setting.DefaultFloat);
+        }
+        if (String.Equals(tab, "Engine", StringComparison.Ordinal))
+        {
+            string ignored;
+            FactorySetEngineTorqueLut(DefaultEngineTorqueLut, out ignored);
         }
         currentGear = ClampGear(currentGear, GetGearCount());
         FactoryCommitSettings();
@@ -353,7 +375,7 @@ public partial class RubberTireWheelScript
         float omega = Vector3.Dot(Rigidbody.angularVelocity, axis);
         Rigidbody parentBody = GetJointParentBody();
         if (parentBody != null) omega -= Vector3.Dot(parentBody.angularVelocity, axis);
-        return Mathf.Abs(omega) * GetCurrentGearRatio() * RpmPerRadPerSecond;
+        return Mathf.Abs(omega) * GetCurrentTotalDriveRatio() * RpmPerRadPerSecond;
     }
 
     internal void FactoryFrictionEllipse(bool kinetic, out float longitudinal, out float lateral)
