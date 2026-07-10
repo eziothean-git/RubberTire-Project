@@ -40,10 +40,10 @@ public partial class RubberTireWheelScript
         // A pneumatic tyre resists motion in both directions while compressed.
         // Rebound damping subtracts support instead of allowing the spring to launch
         // the wheel with no opposing term.
-        float desiredForce = Mathf.Max(0f, springK) * penetration
-                           - Mathf.Max(0f, damperC) * relativeNormalVelocity;
-        desiredForce = Mathf.Clamp(desiredForce, 0f, Mathf.Max(0f, maxNormalForce));
-        float desiredImpulse = desiredForce * dt;
+        float physicalForce = Mathf.Max(0f, springK) * penetration
+                            - Mathf.Max(0f, damperC) * relativeNormalVelocity;
+        physicalForce = Mathf.Clamp(physicalForce, 0f, Mathf.Max(0f, maxNormalForce));
+        float physicalImpulse = physicalForce * dt;
 
         float stopCompressionImpulse = 0f;
         if (enableStableNormalSupport)
@@ -62,14 +62,13 @@ public partial class RubberTireWheelScript
             stopCompressionImpulse = effectiveMass
                 * Mathf.Max(0f, -relativeNormalVelocity)
                 * Mathf.Clamp01(normalSupportVelDamping);
-            desiredImpulse = Mathf.Max(desiredImpulse, stopCompressionImpulse);
-
-            // Hard energy guard: after this support impulse alone, separation speed
-            // cannot exceed the soft recovery target. This removes the old 1/dt^2,
-            // mass-scale over-correction that made light wheels pogo.
+            // The velocity-space guard applies only to the solver's compression
+            // stop. It must not clamp the tuned spring branch: the wheel's isolated
+            // effective mass does not include the chassis load transmitted through
+            // Besiege joints, so using it as a cap made stiffness saturate at roughly
+            // 125 N for a 1 kg wheel at 100 Hz regardless of springK.
             float maximumSafeImpulse = effectiveMass
                 * Mathf.Max(0f, recoverySpeed - relativeNormalVelocity);
-            desiredImpulse = Mathf.Min(desiredImpulse, maximumSafeImpulse);
             stopCompressionImpulse = Mathf.Min(stopCompressionImpulse, maximumSafeImpulse);
         }
 
@@ -77,7 +76,7 @@ public partial class RubberTireWheelScript
         // contacts. The compression stop is purely dissipative, so it bypasses the
         // gate; gating it under-damped hard landings during fade-in and the
         // deepened spring launched the wheel afterwards.
-        float gatedImpulse = desiredImpulse * Mathf.Clamp01(gate);
+        float gatedImpulse = physicalImpulse * Mathf.Clamp01(gate);
         if (stopCompressionImpulse > gatedImpulse) gatedImpulse = stopCompressionImpulse;
         float appliedImpulse = gatedImpulse * Mathf.Max(0f, sampleWeight);
         if (appliedImpulse <= 1e-8f) return 0f;

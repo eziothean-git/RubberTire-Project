@@ -181,8 +181,9 @@ public partial class RubberTireWheelScript
         s.Add(FactoryBool("Tire", "advDec", "Decoupled force application", delegate { return enableDecoupledTireForceApplication; }, delegate(bool v) { enableDecoupledTireForceApplication = v; }).In("Application").Adv());
 
         // ===== Support =====
-        s.Add(FactoryFloat("Support", "k", "Spring stiffness (N/m)", 0f, 200000f, delegate { return springK; }, delegate(float v) { springK = v; }).In("Spring").Curve());
+        s.Add(FactoryFloat("Support", "k", "Spring stiffness (N/m)", 0f, 5000000f, delegate { return springK; }, delegate(float v) { springK = v; }).In("Spring").Curve().Tip("Physical spring branch; heavy machines may need values above 200,000 N/m"));
         s.Add(FactoryFloat("Support", "c", "Damper coefficient", 0f, 5000f, delegate { return damperC; }, delegate(float v) { damperC = v; }).In("Spring").Curve());
+        s.Add(FactoryFloat("Support", "fnMax", "Maximum support force (N)", 0f, 5000000f, delegate { return maxNormalForce; }, delegate(float v) { maxNormalForce = v; }).In("Spring").Curve().Tip("Ceiling after spring and damper calculation; raise this with stiffness for very heavy machines"));
         s.Add(FactoryBool("Support", "nStable", "Energy-safe support", delegate { return enableStableNormalSupport; }, delegate(bool v) { enableStableNormalSupport = v; }).In("Solver").Tip("Velocity-space impulse caps: no pogo, mass-aware landings"));
         s.Add(FactoryFloat("Support", "nErp", "Recovery gain", 0f, 1f, delegate { return normalSupportERP; }, delegate(float v) { normalSupportERP = v; }).In("Solver").When(whenStableSupport).Tip("Fraction of penetration recovered per 0.1 s"));
         s.Add(FactoryFloat("Support", "nDamp", "Compression stop fraction", 0f, 1f, delegate { return normalSupportVelDamping; }, delegate(float v) { normalSupportVelDamping = v; }).In("Solver").When(whenStableSupport).Tip("Fraction of impact speed cancelled on touch-down"));
