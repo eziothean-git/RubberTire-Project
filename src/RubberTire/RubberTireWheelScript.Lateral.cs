@@ -83,8 +83,6 @@ public partial class RubberTireWheelScript
     private bool factoryStaticConstraintSolved;
 
     // Global solver constants, not per-tyre tuning parameters.
-    private const float StaticLockFullSpeed = 0.30f;
-    private const float StaticLockOffSpeed = 1.00f;
     private const float StaticLockTimeConstant = 0.040f;
     private const float StaticStateMaxPointJump = 0.75f;
     private const float StaticStateMinNormalDot = 0.70f;
@@ -248,10 +246,11 @@ public partial class RubberTireWheelScript
         Vector3 tireForce = Vector3.zero;
         if (!enableTireModel) return tireForce;
 
+        Vector3 wheelPoint = GetNominalTreadPoint(sample.p, contactNormal, wheelAxis);
         Vector3 groundVelocity = groundBody != null
             ? groundBody.GetPointVelocity(sample.p)
             : Vector3.zero;
-        Vector3 wheelVelocity = Rigidbody.GetPointVelocity(sample.p);
+        Vector3 wheelVelocity = Rigidbody.GetPointVelocity(wheelPoint);
         Vector3 relativeVelocity = wheelVelocity - groundVelocity;
 
         Vector3 forward = ProjectOnPlane(Vector3.Cross(contactNormal, wheelAxis), contactNormal);
@@ -437,11 +436,34 @@ public partial class RubberTireWheelScript
             forward,
             side,
             contactNormal,
+            wheelPoint,
             sample.p,
             groundBody,
             wheelAxis,
             normalLoad,
             fixedDeltaTime);
+    }
+
+    private Vector3 GetNominalTreadPoint(
+        Vector3 groundPoint,
+        Vector3 contactNormal,
+        Vector3 wheelAxis)
+    {
+        Vector3 center = treadPhysicsGeometryCached
+            ? Rigidbody.position + Rigidbody.rotation * treadCenterBodyLocal
+            : Rigidbody.worldCenterOfMass;
+        float radius = treadPhysicsGeometryCached
+            ? Mathf.Max(1e-4f, treadRadiusWorld)
+            : Mathf.Max(1e-4f, Vector3.Distance(center, groundPoint));
+
+        Vector3 radial = ProjectOnPlane(groundPoint - center, wheelAxis);
+        if (radial.sqrMagnitude <= 1e-8f)
+            radial = ProjectOnPlane(-contactNormal, wheelAxis);
+        if (radial.sqrMagnitude <= 1e-8f)
+            return groundPoint;
+        radial.Normalize();
+        if (Vector3.Dot(radial, -contactNormal) < 0f) radial = -radial;
+        return center + radial * radius;
     }
 
     private Vector3 ApplyLowSpeedStaticConstraint(
@@ -451,7 +473,8 @@ public partial class RubberTireWheelScript
         Vector3 forward,
         Vector3 side,
         Vector3 contactNormal,
-        Vector3 point,
+        Vector3 wheelPoint,
+        Vector3 groundPoint,
         Rigidbody groundBody,
         Vector3 wheelAxis,
         float normalLoad,
@@ -468,9 +491,11 @@ public partial class RubberTireWheelScript
         float constraintSlipSpeed = Mathf.Sqrt(
             slipForward * slipForward + slipSide * slipSide);
 
+        float staticFullSpeed = Mathf.Max(1e-3f, vStatic);
+        float staticOffSpeed = Mathf.Max(staticFullSpeed + 0.05f, staticFullSpeed * 4f);
         float lockBlend = 1f - Mathf.Clamp01(
-            (constraintSlipSpeed - StaticLockFullSpeed)
-            / Mathf.Max(1e-4f, StaticLockOffSpeed - StaticLockFullSpeed));
+            (constraintSlipSpeed - staticFullSpeed)
+            / Mathf.Max(1e-4f, staticOffSpeed - staticFullSpeed));
         lockBlend = lockBlend * lockBlend * (3f - 2f * lockBlend);
         factoryStaticLockBlend = lockBlend;
         factoryStaticConstraintSolved = false;
@@ -479,7 +504,7 @@ public partial class RubberTireWheelScript
         {
             ResetStaticConstraintHistory(state);
             if (dynamicForce.sqrMagnitude > 1e-10f)
-                ApplyTireForce(dynamicForce, point, groundBody, wheelAxis);
+                ApplyTireForce(dynamicForce, wheelPoint, groundPoint, groundBody, wheelAxis);
             return dynamicForce;
         }
 
@@ -494,7 +519,7 @@ public partial class RubberTireWheelScript
             Vector3 omegaDelta = MultiplyWorldInverseInertia(Rigidbody, driveAngularImpulse);
             Vector3 slipDelta = Vector3.Cross(
                 omegaDelta,
-                point - Rigidbody.worldCenterOfMass);
+                wheelPoint - Rigidbody.worldCenterOfMass);
             feedForwardForward = Vector3.Dot(slipDelta, forward);
             feedForwardSide = Vector3.Dot(slipDelta, side);
         }
@@ -505,7 +530,8 @@ public partial class RubberTireWheelScript
             slipVelocity,
             forward,
             side,
-            point,
+            wheelPoint,
+            groundPoint,
             groundBody,
             normalLoad,
             fixedDeltaTime,
@@ -541,7 +567,7 @@ public partial class RubberTireWheelScript
                 }
             }
             if (fallbackForce.sqrMagnitude > 1e-10f)
-                ApplyTireForce(fallbackForce, point, groundBody, wheelAxis);
+                ApplyTireForce(fallbackForce, wheelPoint, groundPoint, groundBody, wheelAxis);
             return fallbackForce;
         }
         factoryStaticConstraintSolved = true;
@@ -554,7 +580,7 @@ public partial class RubberTireWheelScript
             side,
             normalLoad * fixedDeltaTime);
         if (blendedImpulse.sqrMagnitude > 1e-12f)
-            ApplyTireImpulse(blendedImpulse, point, groundBody, wheelAxis);
+            ApplyTireImpulse(blendedImpulse, wheelPoint, groundPoint, groundBody, wheelAxis);
         state.lastConstraintSlipWorld = slipVelocity;
         state.lastConstraintImpulseWorld = blendedImpulse;
         state.lastFeedForwardForward = feedForwardForward;
@@ -583,7 +609,8 @@ public partial class RubberTireWheelScript
         Vector3 slipVelocity,
         Vector3 forward,
         Vector3 side,
-        Vector3 point,
+        Vector3 wheelPoint,
+        Vector3 groundPoint,
         Rigidbody groundBody,
         float normalLoad,
         float fixedDeltaTime,
@@ -595,16 +622,20 @@ public partial class RubberTireWheelScript
         if (normalLoad <= 1e-6f) return false;
         if (side.sqrMagnitude <= 1e-8f) return false;
 
-        float kFF = GetRelativePointVelocityResponse(forward, forward, point, groundBody);
-        float kFS = GetRelativePointVelocityResponse(forward, side, point, groundBody);
-        float kSF = GetRelativePointVelocityResponse(side, forward, point, groundBody);
+        float kFF = GetRelativePointVelocityResponse(
+            forward, forward, wheelPoint, groundPoint, groundBody);
+        float kFS = GetRelativePointVelocityResponse(
+            forward, side, wheelPoint, groundPoint, groundBody);
+        float kSF = GetRelativePointVelocityResponse(
+            side, forward, wheelPoint, groundPoint, groundBody);
         // The analytical effective-mass matrix is symmetric. Averaging the
         // cross terms suppresses small floating-point asymmetry and keeps the
         // velocity correction passive.
         float kCross = 0.5f * (kFS + kSF);
         kFS = kCross;
         kSF = kCross;
-        float kSS = GetRelativePointVelocityResponse(side, side, point, groundBody);
+        float kSS = GetRelativePointVelocityResponse(
+            side, side, wheelPoint, groundPoint, groundBody);
         float determinant = kFF * kSS - kFS * kSF;
         if (determinant <= 1e-8f) return false;
 
@@ -714,12 +745,13 @@ public partial class RubberTireWheelScript
     private float GetRelativePointVelocityResponse(
         Vector3 measureAxis,
         Vector3 impulseAxis,
-        Vector3 point,
+        Vector3 wheelPoint,
+        Vector3 groundPoint,
         Rigidbody groundBody)
     {
-        Vector3 response = GetPointVelocityChange(Rigidbody, point, impulseAxis);
+        Vector3 response = GetPointVelocityChange(Rigidbody, wheelPoint, impulseAxis);
         if (groundBody != null && groundBody != Rigidbody)
-            response += GetPointVelocityChange(groundBody, point, impulseAxis);
+            response += GetPointVelocityChange(groundBody, groundPoint, impulseAxis);
         return Vector3.Dot(measureAxis, response);
     }
 
@@ -785,7 +817,8 @@ public partial class RubberTireWheelScript
 
     private void ApplyTireForce(
         Vector3 force,
-        Vector3 point,
+        Vector3 wheelPoint,
+        Vector3 groundPoint,
         Rigidbody groundRb,
         Vector3 wheelAxisWorld)
     {
@@ -798,7 +831,7 @@ public partial class RubberTireWheelScript
             if (wheelAxisWorld.sqrMagnitude > 1e-10f)
             {
                 wheelAxisWorld.Normalize();
-                Vector3 tau = Vector3.Cross(point - Rigidbody.worldCenterOfMass, force);
+                Vector3 tau = Vector3.Cross(wheelPoint - Rigidbody.worldCenterOfMass, force);
                 float spinTau = Vector3.Dot(tau, wheelAxisWorld);
                 if (Mathf.Abs(spinTau) > 1e-6f)
                     Rigidbody.AddTorque(wheelAxisWorld * spinTau, ForceMode.Force);
@@ -806,16 +839,17 @@ public partial class RubberTireWheelScript
         }
         else
         {
-            Rigidbody.AddForceAtPosition(force, point, ForceMode.Force);
+            Rigidbody.AddForceAtPosition(force, wheelPoint, ForceMode.Force);
         }
 
         if (groundRb != null)
-            groundRb.AddForceAtPosition(-force, point, ForceMode.Force);
+            groundRb.AddForceAtPosition(-force, groundPoint, ForceMode.Force);
     }
 
     private void ApplyTireImpulse(
         Vector3 impulse,
-        Vector3 point,
+        Vector3 wheelPoint,
+        Vector3 groundPoint,
         Rigidbody groundRb,
         Vector3 wheelAxisWorld)
     {
@@ -828,7 +862,7 @@ public partial class RubberTireWheelScript
             {
                 wheelAxisWorld.Normalize();
                 Vector3 angularImpulse = Vector3.Cross(
-                    point - Rigidbody.worldCenterOfMass,
+                    wheelPoint - Rigidbody.worldCenterOfMass,
                     impulse);
                 float spinImpulse = Vector3.Dot(angularImpulse, wheelAxisWorld);
                 if (Mathf.Abs(spinImpulse) > 1e-8f)
@@ -839,11 +873,11 @@ public partial class RubberTireWheelScript
         }
         else
         {
-            Rigidbody.AddForceAtPosition(impulse, point, ForceMode.Impulse);
+            Rigidbody.AddForceAtPosition(impulse, wheelPoint, ForceMode.Impulse);
         }
 
         if (groundRb != null)
-            groundRb.AddForceAtPosition(-impulse, point, ForceMode.Impulse);
+            groundRb.AddForceAtPosition(-impulse, groundPoint, ForceMode.Impulse);
     }
 
     private Vector3 LimitVectorMagnitude(Vector3 v, float maxMagnitude)
