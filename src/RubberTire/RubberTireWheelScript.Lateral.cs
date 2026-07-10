@@ -20,6 +20,10 @@ public partial class RubberTireWheelScript
     public float lowSpeedCreepSpeed = 0.15f;
     public float lowSpeedCreepBlend = 0.75f;
     public float lowSpeedShearDampingC = 1200f;
+    public bool enableLowSpeedAxleDamping = true;
+    public float lowSpeedAxleDampingMaxSpeed = 3.5f;
+    public float lowSpeedAxleDampingTime = 0.12f;
+    public float lowSpeedAxleDampingGripFraction = 0.12f;
     public float axleAirDampingK = 2f;
     public float vEps = 0.2f;
 
@@ -1056,6 +1060,73 @@ public partial class RubberTireWheelScript
 
         if (Mathf.Abs(tau) > 1e-6f)
             Rigidbody.AddTorque(wheelAxisWorld * tau, ForceMode.Force);
+    }
+
+    private void ApplyLowSpeedAxleDamping(
+        float normalLoad,
+        float radius,
+        Vector3 wheelAxisWorld,
+        float fixedDeltaTime)
+    {
+        if (!enableModernLowSpeedTire || !enableLowSpeedAxleDamping || !HasRigidbody) return;
+        if (normalLoad <= 1e-6f || radius <= 1e-6f) return;
+        if (wheelAxisWorld.sqrMagnitude <= 1e-10f) return;
+        if (brake01 > 1e-4f) return; // the explicit brake already supplies a no-overshoot hold
+        wheelAxisWorld.Normalize();
+
+        Rigidbody parentBody = GetJointParentBody();
+        float omegaRelative = Vector3.Dot(Rigidbody.angularVelocity, wheelAxisWorld);
+        if (parentBody != null)
+            omegaRelative -= Vector3.Dot(parentBody.angularVelocity, wheelAxisWorld);
+        if (Mathf.Abs(omegaRelative) <= 1e-5f) return;
+
+        float fadeEnd = Mathf.Max(0.05f, lowSpeedAxleDampingMaxSpeed);
+        float treadSpeed = Mathf.Abs(omegaRelative) * radius;
+        if (treadSpeed >= fadeEnd) return;
+        float u = Mathf.Clamp01(treadSpeed / fadeEnd);
+        float fade = 1f - u * u * (3f - 2f * u);
+
+        // Equal/opposite axle impulses reproduce the passive part of the stock
+        // hinge motor without its infinite auto-brake force. Solve in relative
+        // angular-velocity space so the impulse can never cross zero in one step.
+        float inverseResponse = Vector3.Dot(
+            wheelAxisWorld,
+            MultiplyWorldInverseInertia(Rigidbody, wheelAxisWorld));
+        bool reactOnParent = parentBody != null && !parentBody.isKinematic;
+        if (reactOnParent)
+        {
+            inverseResponse += Vector3.Dot(
+                wheelAxisWorld,
+                MultiplyWorldInverseInertia(parentBody, wheelAxisWorld));
+        }
+        if (inverseResponse <= 1e-8f) return;
+
+        float dt = Mathf.Max(1e-5f, fixedDeltaTime);
+        float timeConstant = Mathf.Max(0.01f, lowSpeedAxleDampingTime);
+        float correction = (1f - Mathf.Exp(-dt / timeConstant)) * fade;
+        float axleImpulse = -omegaRelative * correction / inverseResponse;
+
+        float longitudinalScale = enableCombinedSlipFriction
+            ? Mathf.Max(0f, longitudinalGripScale)
+            : 1f;
+        float maximumImpulse = MuStaticEff()
+            * longitudinalScale
+            * normalLoad
+            * radius
+            * dt
+            * Mathf.Clamp01(lowSpeedAxleDampingGripFraction);
+        axleImpulse = Mathf.Clamp(axleImpulse, -maximumImpulse, maximumImpulse);
+        if (Mathf.Abs(axleImpulse) <= 1e-8f) return;
+
+        Rigidbody.AddTorque(
+            wheelAxisWorld * axleImpulse,
+            ForceMode.Impulse);
+        if (reactOnParent)
+        {
+            parentBody.AddTorque(
+                wheelAxisWorld * -axleImpulse,
+                ForceMode.Impulse);
+        }
     }
 
     private float GetInertiaAroundWorldAxis(Vector3 axisWorld)

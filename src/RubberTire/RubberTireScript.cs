@@ -542,6 +542,7 @@ public partial class RubberTireWheelScript : BlockScript
 
         ApplyAccumulatedLateralPatches(aAxisWheel, dtFixed, doDbgSample);
 
+        ApplyLowSpeedAxleDamping(totalNormalLoadForAxle, R, aAxisWheel, dtFixed);
         ApplyAxleSpinStabilization(totalNormalLoadForAxle, R, aAxisWheel);
 
         // Debug：本帧是否更新了“本地空间”绘制数据
