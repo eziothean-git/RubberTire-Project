@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using Modding;
@@ -29,6 +30,10 @@ public partial class RubberTireWheelScript : BlockScript
     public bool enableTreadRayFan = false; // true: cast multiple rays across finite tread width
     public int treadRayCount = 3;
 
+    // A1: radial contact directions around the wheel circle (1 = legacy
+    // gravity-down ray only). Walls, ceilings and loop tracks need > 1.
+    public int radialRayCount = 8;
+
     // ====== Multi-point settings ======
     public int maxContactPoints = 6;          // Top-N colliders by penetration after aggregation
     public int contactStateTTLSteps = 30;     // 固定步数未见就淘汰状态（避免字典无限长）
@@ -57,7 +62,11 @@ public partial class RubberTireWheelScript : BlockScript
     // =========================
     // 角速度上限
     // =========================
-    public float maxAngularVelocityLimit = 250f;
+    // A5: solver-stability policy. Above ~0.5 rad of rotation per fixed step the
+    // block joint cannot hold axle alignment and precession diverges ("wobble").
+    // Hard cap, drive torque gating and wobble damping all share this bound.
+    internal const float SpinHardCap = 60f;
+    public float maxAngularVelocityLimit = SpinHardCap;
 
     // =========================
     // Debug 可视化（不动）
@@ -84,6 +93,14 @@ public partial class RubberTireWheelScript : BlockScript
     private readonly HashSet<Collider> contacts = new HashSet<Collider>();
     private CapsuleCollider treadTriggerCapsule;
     private int fixedStepCounter = 0;
+
+    // B3: raycast contact result of the previous fixed step (rolling damping gate).
+    private bool lastStepHadRaycastContact;
+
+    // A5: immediate joint parent (steering knuckle, suspension arm, chassis...).
+    private Rigidbody jointParentBody;
+    private bool jointParentCached;
+    private bool lastGatherWasMultiRay;
 
     // Temp: count contact samples per attached rigidbody (for per-body weight)
     private readonly Dictionary<int, int> tmpRbSampleCounts = new Dictionary<int, int>(16);
@@ -176,6 +193,12 @@ public partial class RubberTireWheelScript : BlockScript
         public float pen;
     }
 
+    // C1: cached comparers; inline lambdas allocate a Comparison<T> per call.
+    private static readonly Comparison<HitSample> HitSamplePenDescending =
+        delegate(HitSample a, HitSample b) { return b.pen.CompareTo(a.pen); };
+    private static readonly Comparison<ContactSample> ContactSamplePenDescending =
+        delegate(ContactSample a, ContactSample b) { return b.pen.CompareTo(a.pen); };
+
     private readonly Dictionary<int, List<HitSample>> hitsByCol = new Dictionary<int, List<HitSample>>(64);
 
     // ----------- 生命周期 -----------
@@ -193,11 +216,14 @@ public partial class RubberTireWheelScript : BlockScript
         currentGear = 1;
         throttle01 = 0f;
         brake01 = 0f;
+        lastStepHadRaycastContact = false;
+        jointParentCached = false;
+        jointParentBody = null;
 
         pointStates.Clear();
         colStates.Clear();
 
-        Rigidbody.maxAngularVelocity = Mathf.Max(10f, maxAngularVelocityLimit);
+        Rigidbody.maxAngularVelocity = GetSpinCap();
 
         // Capture baseline angularDrag so we can add/remove extra rolling resistance without breaking other physics.
         baseAngularDrag = Rigidbody.angularDrag;
@@ -218,6 +244,9 @@ public partial class RubberTireWheelScript : BlockScript
         colStates.Clear();
         throttle01 = 0f;
         brake01 = 0f;
+        lastStepHadRaycastContact = false;
+        jointParentCached = false;
+        jointParentBody = null;
 
         DestroyDebugObjects();
         treadTriggerCapsule = null;
@@ -247,13 +276,33 @@ public partial class RubberTireWheelScript : BlockScript
 
         FactoryPullSettings();
         contactRayMask = BuildContactRayMask();
-        Rigidbody.maxAngularVelocity = Mathf.Max(10f, maxAngularVelocityLimit);
+        Rigidbody.maxAngularVelocity = GetSpinCap();
 
         // Legacy rolling damping uses angularDrag. The advanced mode restores angularDrag and applies load-based torque per contact.
-        ApplyRollingAngularDrag(contacts.Count > 0 && !useLoadSensitiveRollingResistance);
+        // B3: gated by the previous step's raycast contact; the trigger set is no longer part of the contact model.
+        ApplyRollingAngularDrag(lastStepHadRaycastContact && !useLoadSensitiveRollingResistance);
 
         // ===== 0) Drive/Brake (remappable keys) =====
         ApplyDriveBrake();
+        ApplyAxleWobbleDamping(GetDriveAxisWorld());
+
+        // Constant test torque hook. Applied before contact processing so the
+        // static-friction feed-forward (B1) sees it in the same step.
+        if (Mathf.Abs(driveTorque) > 1e-6f)
+        {
+            float hookFlipSign = Flipped ? -1f : 1f;
+            Vector3 hookAxis = GetDriveAxisWorld();
+            float hookTau = ClampSpinPumpingTorque(
+                driveTorque * hookFlipSign,
+                Vector3.Dot(Rigidbody.angularVelocity, hookAxis),
+                hookAxis,
+                Time.fixedDeltaTime);
+            if (Mathf.Abs(hookTau) > 1e-6f)
+            {
+                pendingDriveAxisTorque += hookTau;
+                Rigidbody.AddTorque(hookAxis * hookTau, ForceMode.Force);
+            }
+        }
         MarkAllColliderStatesUnseen();
 
         // ===== 轮心/半径（世界）=====
@@ -315,7 +364,8 @@ public partial class RubberTireWheelScript : BlockScript
 
         // ===== 1) Gather aggregated contact samples, then take Top-N colliders =====
         int N = Mathf.Clamp(maxContactPoints, 1, 6);
-        GatherTopContactSamples(center, downDir, R, doClip, axisWorld, halfW, N, topSamples);
+        GatherTopContactSamples(center, downDir, R, doClip, axisWorld, halfW, aAxisWheel, N, topSamples);
+        lastStepHadRaycastContact = topSamples.Count > 0;
         ResetLateralPatchAccumulators();
 
         if (topSamples.Count == 0)
@@ -439,13 +489,6 @@ public partial class RubberTireWheelScript : BlockScript
         ApplyAccumulatedLateralPatches(aAxisWheel, dtFixed, doDbgSample);
 
         ApplyAxleSpinStabilization(totalNormalLoadForAxle, R, aAxisWheel);
-
-        // Optional drive torque test hook
-        if (Mathf.Abs(driveTorque) > 1e-6f)
-        {
-            float flipSign = Flipped ? -1f : 1f;
-            Rigidbody.AddTorque(GetDriveAxisWorld() * (driveTorque * flipSign), ForceMode.Force);
-        }
 
         // Debug：本帧是否更新了“本地空间”绘制数据
         if (doDbgSample)
@@ -611,80 +654,121 @@ public partial class RubberTireWheelScript : BlockScript
     private void GatherTopContactSamples(
         Vector3 center, Vector3 downDir, float R,
         bool doClip, Vector3 axisWorldUnit, float halfWWorld,
-        int N, List<ContactSample> outTop)
+        Vector3 wheelAxisUnit, int N, List<ContactSample> outTop)
     {
         outTop.Clear();
         RecycleHitLists();
 
         if (!useRaycastContact) return;
 
-        float maxDist = R + Mathf.Max(0f, rayExtra);
+        // A2: back the origin off along -rayDir so the ray still starts outside
+        // the ground when the wheel centre itself has penetrated the surface.
+        float backoff = 0.5f * R;
+        float maxDist = R + backoff + Mathf.Max(0f, rayExtra);
 
-        int rayCount = 1;
+        int fanCount = 1;
         bool useRayFan = enableTreadRayFan && doClip && halfWWorld > 1e-4f && axisWorldUnit.sqrMagnitude > 1e-8f;
         if (useRayFan)
         {
             axisWorldUnit.Normalize();
-            rayCount = Mathf.Clamp(treadRayCount, 1, 7);
-            if (rayCount > 1 && (rayCount % 2) == 0) rayCount = Mathf.Min(7, rayCount + 1);
+            fanCount = Mathf.Clamp(treadRayCount, 1, 7);
+            if (fanCount > 1 && (fanCount % 2) == 0) fanCount = Mathf.Min(7, fanCount + 1);
         }
 
-        for (int r = 0; r < rayCount; r++)
+        // A1: radial directions in the wheel plane, rotated around the axle.
+        int dirCount = Mathf.Clamp(radialRayCount, 1, 12);
+        Vector3 wheelAxis = wheelAxisUnit.sqrMagnitude > 1e-10f
+            ? wheelAxisUnit.normalized
+            : GetWheelAxisWorld();
+
+        // D3: one extra ray along the in-plane velocity when a single step
+        // covers a meaningful fraction of the radius, so thin obstacles between
+        // radial directions are still seen along the approach path.
+        Vector3 velDir = Vector3.zero;
+        float dtStep = Mathf.Max(1e-5f, Time.fixedDeltaTime);
+        Vector3 velocity = Rigidbody.velocity;
+        if (velocity.magnitude * dtStep > 0.25f * R)
         {
-            float u = 0f;
-            if (rayCount > 1) u = -1f + (2f * (float)r) / (float)(rayCount - 1);
+            velDir = ProjectOnPlane(velocity, wheelAxis);
+            if (velDir.sqrMagnitude > 1e-8f) velDir.Normalize();
+            else velDir = Vector3.zero;
+        }
+        bool hasVelDir = velDir.sqrMagnitude > 0.5f;
+        int totalDirs = dirCount + (hasVelDir ? 1 : 0);
+        lastGatherWasMultiRay = totalDirs > 1 || fanCount > 1;
 
-            Vector3 rayOrigin = useRayFan ? center + axisWorldUnit * (u * halfWWorld) : center;
-            int hitCount = Physics.RaycastNonAlloc(
-                rayOrigin,
-                downDir,
-                raycastHitBuffer,
-                maxDist,
-                contactRayMask,
-                QueryTriggerInteraction.Ignore
-            );
+        // A4: the joint parent is part of this machine's axle assembly, never ground.
+        Rigidbody parentRb = GetJointParentBody();
 
-            if (hitCount <= 0) continue;
-            if (hitCount > raycastHitBuffer.Length) hitCount = raycastHitBuffer.Length;
+        for (int d = 0; d < totalDirs; d++)
+        {
+            Vector3 rayDir = d < dirCount
+                ? Quaternion.AngleAxis((360f * d) / dirCount, wheelAxis) * downDir
+                : velDir;
 
-            // collect hits and group by collider
-            for (int i = 0; i < hitCount; i++)
+            for (int r = 0; r < fanCount; r++)
             {
-                RaycastHit hit = raycastHitBuffer[i];
-                Collider c = hit.collider;
-                if (c == null) continue;
+                float u = 0f;
+                if (fanCount > 1) u = -1f + (2f * (float)r) / (float)(fanCount - 1);
 
-                if (c.attachedRigidbody == Rigidbody) continue;
+                Vector3 rayOrigin = useRayFan ? center + axisWorldUnit * (u * halfWWorld) : center;
+                rayOrigin -= rayDir * backoff;
+                int hitCount = Physics.RaycastNonAlloc(
+                    rayOrigin,
+                    rayDir,
+                    raycastHitBuffer,
+                    maxDist,
+                    contactRayMask,
+                    QueryTriggerInteraction.Ignore
+                );
 
-                Vector3 p = hit.point;
-                Vector3 n = hit.normal;
-                if (n.sqrMagnitude < 1e-12f) continue;
-                n.Normalize();
+                if (hitCount <= 0) continue;
+                if (hitCount > raycastHitBuffer.Length) hitCount = raycastHitBuffer.Length;
 
-                if (doClip && !IsWithinTreadWidth(p, center, axisWorldUnit, halfWWorld))
-                    continue;
-
-                float dist = hit.distance;
-                if (dist <= 1e-6f) dist = Vector3.Distance(rayOrigin, p);
-                float pen = R - dist;
-                if (pen <= minPenForContact) continue;
-
-                int id = c.GetInstanceID();
-
-                HitSample hs;
-                hs.col = c;
-                hs.colId = id;
-                hs.p = p;
-                hs.n = n;
-                hs.pen = pen;
-
-                List<HitSample> list;
-                if (!hitsByCol.TryGetValue(id, out list))
+                // collect hits and group by collider
+                for (int i = 0; i < hitCount; i++)
                 {
-                    list = GetHitListFromPool();
-                    hitsByCol.Add(id, list);
+                    RaycastHit hit = raycastHitBuffer[i];
+                    Collider c = hit.collider;
+                    if (c == null) continue;
+
+                    if (c.attachedRigidbody == Rigidbody) continue;
+                    if (parentRb != null && c.attachedRigidbody == parentRb) continue;
+
+                    Vector3 p = hit.point;
+                    Vector3 n = hit.normal;
+                    if (n.sqrMagnitude < 1e-12f) continue;
+                    n.Normalize();
+
+                    if (doClip && !IsWithinTreadWidth(p, center, axisWorldUnit, halfWWorld))
+                        continue;
+
+                    // Defensive: RaycastHit.distance can be 0 when the origin sits on
+                    // the collider surface; the backed-off origin makes that likelier.
+                    float hitDist = hit.distance;
+                    if (hitDist <= 1e-6f) hitDist = Vector3.Distance(rayOrigin, p);
+                    float dist = hitDist - backoff;
+                    float pen = R - dist;
+                    if (pen > R) pen = R;
+                    if (pen <= minPenForContact) continue;
+
+                    int id = c.GetInstanceID();
+
+                    HitSample hs;
+                    hs.col = c;
+                    hs.colId = id;
+                    hs.p = p;
+                    hs.n = n;
+                    hs.pen = pen;
+
+                    List<HitSample> list;
+                    if (!hitsByCol.TryGetValue(id, out list))
+                    {
+                        list = GetHitListFromPool();
+                        hitsByCol.Add(id, list);
+                    }
+                    list.Add(hs);
                 }
-                list.Add(hs);
             }
         }
 
@@ -697,7 +781,7 @@ public partial class RubberTireWheelScript : BlockScript
             List<HitSample> list = kv.Value;
             if (list == null || list.Count == 0) continue;
 
-            list.Sort((a, b) => b.pen.CompareTo(a.pen));
+            list.Sort(HitSamplePenDescending);
             int take = Mathf.Min(K, list.Count);
 
             float wsum = 0f;
@@ -726,7 +810,9 @@ public partial class RubberTireWheelScript : BlockScript
 
             float distAgg = Vector3.Distance(center, pAgg);
             float penAgg;
-            if (useRayFan && rayCount > 1)
+            // Weighted penetration average whenever several rays contributed;
+            // |center - pAgg| under-reports depth for blended multi-ray points.
+            if (lastGatherWasMultiRay)
                 penAgg = penAcc / wsum;
             else
                 penAgg = R - distAgg;
@@ -748,7 +834,7 @@ public partial class RubberTireWheelScript : BlockScript
 
         if (outTop.Count == 0) return;
 
-        outTop.Sort((a, b) => b.pen.CompareTo(a.pen));
+        outTop.Sort(ContactSamplePenDescending);
         if (outTop.Count > N)
             outTop.RemoveRange(N, outTop.Count - N);
     }
@@ -767,10 +853,7 @@ public partial class RubberTireWheelScript : BlockScript
     private void UpdateColliderStatesFromSamples(List<ContactSample> samplesNow)
     {
         int inFrames = Mathf.Max(1, gateFadeInFrames);
-        int outFrames = Mathf.Max(1, gateFadeOutFrames);
-
         float gateUp = 1f / (float)inFrames;
-        float gateDn = 1f / (float)outFrames;
 
         float alpha = Mathf.Clamp01(normalFilterAlpha);
 
@@ -974,6 +1057,26 @@ public partial class RubberTireWheelScript : BlockScript
         return (a.sqrMagnitude > 1e-10f) ? a.normalized : transform.up;
     }
 
+    private float GetSpinCap()
+    {
+        return Mathf.Min(Mathf.Max(10f, maxAngularVelocityLimit), SpinHardCap);
+    }
+
+    // A5: immediate joint parent for relative angular velocity. Cached per
+    // simulation; Besiege builds the simulation joints at simulation start.
+    private Rigidbody GetJointParentBody()
+    {
+        if (!jointParentCached)
+        {
+            jointParentCached = true;
+            Joint joint = GetComponent<Joint>();
+            jointParentBody = (joint != null && joint.connectedBody != Rigidbody)
+                ? joint.connectedBody
+                : null;
+        }
+        return jointParentBody;
+    }
+
     private float GetAxisScaleWorld()
     {
         Vector3 s = transform.lossyScale;
@@ -1067,7 +1170,8 @@ public partial class RubberTireWheelScript : BlockScript
     // =========================
     private void EnsureDebugObjects()
     {
-        if (dbgRoot == null)
+        bool createdRoot = (dbgRoot == null);
+        if (createdRoot)
         {
             dbgRoot = new GameObject("RubberTire_Debug");
             if (MainVis != null) dbgRoot.transform.SetParent(MainVis, false);
@@ -1084,7 +1188,9 @@ public partial class RubberTireWheelScript : BlockScript
         // 多接触点可视化池
         EnsureDebugPointPool(Mathf.Clamp(maxContactPoints, 1, 12));
 
-        HideDebugObjects();
+        // C2: start hidden only on first creation. Hiding on every call made
+        // SimulateLateUpdateAlways toggle the whole hierarchy off/on each frame.
+        if (createdRoot) HideDebugObjects();
     }
 
     private void EnsureDebugLocalCapacity(int desired)

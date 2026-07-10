@@ -33,6 +33,14 @@ public partial class RubberTireWheelScript
     public bool decoupleTireForceAndTorque = true;
     public bool enableDecoupledTireForceApplication = false;
 
+    // D1: scale grip by the ground collider's PhysicMaterial (ice, sand...).
+    // Neutral reference is Unity's common 0.6 default so stock ground ≈ 1.0.
+    public bool useSurfaceFriction = false;
+
+    // D2: tyre load sensitivity, mu_eff = mu * (Fref/Fn)^s. 0 = off.
+    public float muLoadSensitivity = 0f;
+    public float muLoadReference = 2000f;
+
     private class TirePointState
     {
         public Vector3 shearDispWorld = Vector3.zero;
@@ -42,6 +50,8 @@ public partial class RubberTireWheelScript
         public Vector3 lastConstraintSlipWorld = Vector3.zero;
         public Vector3 lastConstraintImpulseWorld = Vector3.zero;
         public bool hasConstraintHistory;
+        public float lastFeedForwardForward;
+        public float lastFeedForwardSide;
         public int lastSeenStep;
     }
 
@@ -75,12 +85,40 @@ public partial class RubberTireWheelScript
     private const float StaticStateMaxPointJump = 0.75f;
     private const float StaticStateMinNormalDot = 0.70f;
 
+    // D1/D2: per-patch grip scale, set by ApplyAccumulatedLateralPatches before
+    // that patch's force evaluation runs (ambient to avoid re-plumbing mu
+    // through every solver helper).
+    private const float SurfaceFrictionNeutral = 0.6f;
+    private float activeMuScale = 1f;
+
+    private float MuStaticEff() { return muStatic * activeMuScale; }
+    private float MuKineticEff() { return muKinetic * activeMuScale; }
+
+    private float ComputeMuScale(Collider groundCollider, float normalLoad)
+    {
+        float scale = 1f;
+        if (useSurfaceFriction && groundCollider != null)
+        {
+            PhysicMaterial material = groundCollider.sharedMaterial;
+            if (material != null)
+                scale *= Mathf.Clamp(material.dynamicFriction / SurfaceFrictionNeutral, 0.05f, 2f);
+        }
+        float sensitivity = Mathf.Clamp(muLoadSensitivity, 0f, 0.5f);
+        if (sensitivity > 1e-4f && normalLoad > 1e-3f)
+        {
+            float reference = Mathf.Max(1f, muLoadReference);
+            scale *= Mathf.Clamp(Mathf.Pow(reference / normalLoad, sensitivity), 0.5f, 1.5f);
+        }
+        return scale;
+    }
+
     private void ResetLateralPatchAccumulators()
     {
         lateralPatchCount = 0;
         factoryTireLongForce = 0f;
         factoryTireLatForce = 0f;
         factoryTireNormalLoad = 0f;
+        activeMuScale = 1f;
     }
 
     private int AccumulateLateralPatch(
@@ -156,6 +194,7 @@ public partial class RubberTireWheelScript
             else sample.n = Vector3.up;
 
             float legacyScale = patch.legacyScaleLoad / patch.normalLoad;
+            activeMuScale = ComputeMuScale(sample.col, patch.normalLoad);
             Vector3 force = EvaluateAndApplyTireForce(
                 patch.key,
                 sample,
@@ -288,20 +327,20 @@ public partial class RubberTireWheelScript
                 {
                     scale = GetCombinedFrictionScale(
                         rawForce, forward, side,
-                        muStatic * longScale * normalLoad,
-                        muStatic * latScale * normalLoad);
+                        MuStaticEff() * longScale * normalLoad,
+                        MuStaticEff() * latScale * normalLoad);
                     if (scale < 0.9999f)
                         scale = GetCombinedFrictionScale(
                             rawForce, forward, side,
-                            muKinetic * longScale * normalLoad,
-                            muKinetic * latScale * normalLoad);
+                            MuKineticEff() * longScale * normalLoad,
+                            MuKineticEff() * latScale * normalLoad);
                 }
                 else
                 {
                     scale = GetCombinedFrictionScale(
                         rawForce, forward, side,
-                        muKinetic * longScale * normalLoad,
-                        muKinetic * latScale * normalLoad);
+                        MuKineticEff() * longScale * normalLoad,
+                        MuKineticEff() * latScale * normalLoad);
                 }
 
                 if (scale < 0.9999f)
@@ -312,8 +351,8 @@ public partial class RubberTireWheelScript
             }
             else
             {
-                float maximumStaticForce = muStatic * normalLoad;
-                float maximumKineticForce = muKinetic * normalLoad;
+                float maximumStaticForce = MuStaticEff() * normalLoad;
+                float maximumKineticForce = MuKineticEff() * normalLoad;
                 float forceMagnitude = rawForce.magnitude;
                 if (staticZone)
                 {
@@ -344,7 +383,7 @@ public partial class RubberTireWheelScript
 
             if (enableSinglePassLoadScaling)
             {
-                float postMu = staticZone ? muStatic : muKinetic;
+                float postMu = staticZone ? MuStaticEff() : MuKineticEff();
                 if (enableCombinedSlipFriction && side.sqrMagnitude > 1e-6f)
                 {
                     tireForce = ClampCombinedTireForce(
@@ -364,12 +403,12 @@ public partial class RubberTireWheelScript
             {
                 tireForce = BuildCombinedKineticFriction(
                     slipVelocity, forward, side,
-                    muKinetic * Mathf.Max(0f, longitudinalGripScale) * normalLoad,
-                    muKinetic * Mathf.Max(0f, lateralGripScale) * normalLoad);
+                    MuKineticEff() * Mathf.Max(0f, longitudinalGripScale) * normalLoad,
+                    MuKineticEff() * Mathf.Max(0f, lateralGripScale) * normalLoad);
             }
             else
             {
-                tireForce = -slipVelocity / slipSpeed * (muKinetic * normalLoad);
+                tireForce = -slipVelocity / slipSpeed * (MuKineticEff() * normalLoad);
             }
         }
 
@@ -427,6 +466,22 @@ public partial class RubberTireWheelScript
             return dynamicForce;
         }
 
+        // B1: feed the self-applied drive/brake torque of THIS step forward so
+        // the solver does not wait a step for the disturbance estimator.
+        float feedForwardForward = 0f;
+        float feedForwardSide = 0f;
+        if (Mathf.Abs(pendingDriveAxisTorque) > 1e-6f)
+        {
+            Vector3 driveAngularImpulse = pendingDriveAxisWorld
+                * (pendingDriveAxisTorque * fixedDeltaTime);
+            Vector3 omegaDelta = MultiplyWorldInverseInertia(Rigidbody, driveAngularImpulse);
+            Vector3 slipDelta = Vector3.Cross(
+                omegaDelta,
+                point - Rigidbody.worldCenterOfMass);
+            feedForwardForward = Vector3.Dot(slipDelta, forward);
+            feedForwardSide = Vector3.Dot(slipDelta, side);
+        }
+
         Vector3 staticImpulse;
         bool canStick = TrySolveStaticImpulse(
             state,
@@ -437,6 +492,8 @@ public partial class RubberTireWheelScript
             groundBody,
             normalLoad,
             fixedDeltaTime,
+            feedForwardForward,
+            feedForwardSide,
             out staticImpulse);
 
         if (!canStick)
@@ -458,8 +515,25 @@ public partial class RubberTireWheelScript
             ApplyTireImpulse(blendedImpulse, point, groundBody, wheelAxis);
         state.lastConstraintSlipWorld = slipVelocity;
         state.lastConstraintImpulseWorld = blendedImpulse;
+        state.lastFeedForwardForward = feedForwardForward;
+        state.lastFeedForwardSide = feedForwardSide;
         state.hasConstraintHistory = true;
-        return blendedImpulse / Mathf.Max(1e-5f, fixedDeltaTime);
+
+        // B2: keep the brush state consistent with the applied tangential
+        // impulse so the handoff back to the dynamic branch is continuous.
+        Vector3 appliedForce = blendedImpulse / Mathf.Max(1e-5f, fixedDeltaTime);
+        if (enableTireRelaxation && shearK > 1e-6f)
+        {
+            state.shearDispWorld = -appliedForce / shearK;
+            if (maxShearDisp > 1e-5f)
+            {
+                float displacement = state.shearDispWorld.magnitude;
+                if (displacement > maxShearDisp)
+                    state.shearDispWorld *= maxShearDisp / displacement;
+            }
+            state.FtireFiltered = appliedForce;
+        }
+        return appliedForce;
     }
 
     private bool TrySolveStaticImpulse(
@@ -471,6 +545,8 @@ public partial class RubberTireWheelScript
         Rigidbody groundBody,
         float normalLoad,
         float fixedDeltaTime,
+        float feedForwardForward,
+        float feedForwardSide,
         out Vector3 impulseWorld)
     {
         impulseWorld = Vector3.zero;
@@ -517,17 +593,19 @@ public partial class RubberTireWheelScript
             disturbanceForward = velocityForward
                                - previousVelocityForward
                                - kFF * previousImpulseForward
-                               - kFS * previousImpulseSide;
+                               - kFS * previousImpulseSide
+                               - state.lastFeedForwardForward;
             disturbanceSide = velocitySide
                             - previousVelocitySide
                             - kSF * previousImpulseForward
-                            - kSS * previousImpulseSide;
+                            - kSS * previousImpulseSide
+                            - state.lastFeedForwardSide;
         }
 
         float correction = 1f - Mathf.Exp(-dt / StaticLockTimeConstant);
         float inverseDeterminant = 1f / determinant;
-        float targetForward = correction * velocityForward + disturbanceForward;
-        float targetSide = correction * velocitySide + disturbanceSide;
+        float targetForward = correction * velocityForward + disturbanceForward + feedForwardForward;
+        float targetSide = correction * velocitySide + disturbanceSide + feedForwardSide;
         float deltaForward = -(kSS * targetForward - kFS * targetSide)
                            * inverseDeterminant;
         float deltaSide = -(-kSF * targetForward + kFF * targetSide)
@@ -536,12 +614,12 @@ public partial class RubberTireWheelScript
         float candidateForward = deltaForward;
         float candidateSide = deltaSide;
         float normalImpulse = normalLoad * dt;
-        float maximumForward = muStatic
+        float maximumForward = MuStaticEff()
                              * (enableCombinedSlipFriction
                                 ? Mathf.Max(0f, longitudinalGripScale)
                                 : 1f)
                              * normalImpulse;
-        float maximumSide = muStatic
+        float maximumSide = MuStaticEff()
                           * (enableCombinedSlipFriction
                              ? Mathf.Max(0f, lateralGripScale)
                              : 1f)
@@ -586,6 +664,8 @@ public partial class RubberTireWheelScript
     {
         state.lastConstraintSlipWorld = Vector3.zero;
         state.lastConstraintImpulseWorld = Vector3.zero;
+        state.lastFeedForwardForward = 0f;
+        state.lastFeedForwardSide = 0f;
         state.hasConstraintHistory = false;
     }
 
@@ -623,12 +703,12 @@ public partial class RubberTireWheelScript
         Vector3 side,
         float normalImpulse)
     {
-        float maximumForward = muStatic
+        float maximumForward = MuStaticEff()
                              * (enableCombinedSlipFriction
                                 ? Mathf.Max(0f, longitudinalGripScale)
                                 : 1f)
                              * normalImpulse;
-        float maximumSide = muStatic
+        float maximumSide = MuStaticEff()
                           * (enableCombinedSlipFriction
                              ? Mathf.Max(0f, lateralGripScale)
                              : 1f)
@@ -775,8 +855,8 @@ public partial class RubberTireWheelScript
 
         if (enableCombinedSlipFriction && side.sqrMagnitude > 1e-6f)
         {
-            float maxLong = muStatic * Mathf.Max(0f, longitudinalGripScale) * normalLoad;
-            float maxSide = muStatic * Mathf.Max(0f, lateralGripScale) * normalLoad;
+            float maxLong = MuStaticEff() * Mathf.Max(0f, longitudinalGripScale) * normalLoad;
+            float maxSide = MuStaticEff() * Mathf.Max(0f, lateralGripScale) * normalLoad;
             Vector3 demand = Vector3.zero;
             float vx = Vector3.Dot(vSlip, forward);
             if (Mathf.Abs(vx) > 1e-6f && maxLong > 0f)
@@ -789,8 +869,47 @@ public partial class RubberTireWheelScript
 
         float speed = vSlip.magnitude;
         if (speed <= 1e-6f) return Vector3.zero;
-        float demandMagnitude = muStatic * normalLoad * Mathf.Clamp01(speed / creepV);
+        float demandMagnitude = MuStaticEff() * normalLoad * Mathf.Clamp01(speed / creepV);
         return -vSlip / speed * demandMagnitude;
+    }
+
+    // A5 anti-wobble: at high spin the joint solver cannot hold axle alignment
+    // and precession grows ("wobble"). Damp the perpendicular-to-axle component
+    // of the wheel-vs-joint-parent angular velocity. RELATIVE angular velocity
+    // is essential: vehicle yaw/steering/suspension articulation must not be
+    // resisted. Engagement ramps in with |omegaRel| so the damper is inert at
+    // normal speeds. One-sided on purpose: this is an energy sink, and reacting
+    // the impulse on the parent would feed the wobble back into the chassis.
+    private const float WobbleDampingFraction = 0.25f;
+
+    private void ApplyAxleWobbleDamping(Vector3 wheelAxisWorld)
+    {
+        if (!HasRigidbody) return;
+        if (wheelAxisWorld.sqrMagnitude < 1e-10f) return;
+        wheelAxisWorld.Normalize();
+
+        Vector3 omegaRel = Rigidbody.angularVelocity;
+        Rigidbody parentBody = GetJointParentBody();
+        if (parentBody != null) omegaRel -= parentBody.angularVelocity;
+
+        float spinCap = GetSpinCap();
+        float engageStart = 0.5f * spinCap;
+        float engage = Mathf.Clamp01(
+            (omegaRel.magnitude - engageStart)
+            / Mathf.Max(1e-4f, spinCap - engageStart));
+        if (engage <= 1e-4f) return;
+
+        Vector3 omegaPerp = omegaRel
+            - Vector3.Dot(omegaRel, wheelAxisWorld) * wheelAxisWorld;
+        float perpSpeed = omegaPerp.magnitude;
+        if (perpSpeed <= 1e-4f) return;
+
+        float inertia = GetInertiaAroundWorldAxis(omegaPerp / perpSpeed);
+        if (inertia <= 1e-6f) return;
+
+        Rigidbody.AddTorque(
+            omegaPerp * (-inertia * WobbleDampingFraction * engage),
+            ForceMode.Impulse);
     }
 
     private void ApplyAxleSpinStabilization(float normalLoad, float radius, Vector3 wheelAxisWorld)

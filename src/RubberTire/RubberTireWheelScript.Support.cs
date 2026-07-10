@@ -45,6 +45,7 @@ public partial class RubberTireWheelScript
         desiredForce = Mathf.Clamp(desiredForce, 0f, Mathf.Max(0f, maxNormalForce));
         float desiredImpulse = desiredForce * dt;
 
+        float stopCompressionImpulse = 0f;
         if (enableStableNormalSupport)
         {
             float effectiveMass = GetEffectiveNormalMass(
@@ -58,7 +59,7 @@ public partial class RubberTireWheelScript
 
             // Stopping compression is dissipative. It can raise an under-tuned spring
             // up to the impulse needed to cancel a fraction of incoming velocity.
-            float stopCompressionImpulse = effectiveMass
+            stopCompressionImpulse = effectiveMass
                 * Mathf.Max(0f, -relativeNormalVelocity)
                 * Mathf.Clamp01(normalSupportVelDamping);
             desiredImpulse = Mathf.Max(desiredImpulse, stopCompressionImpulse);
@@ -69,9 +70,16 @@ public partial class RubberTireWheelScript
             float maximumSafeImpulse = effectiveMass
                 * Mathf.Max(0f, recoverySpeed - relativeNormalVelocity);
             desiredImpulse = Mathf.Min(desiredImpulse, maximumSafeImpulse);
+            stopCompressionImpulse = Mathf.Min(stopCompressionImpulse, maximumSafeImpulse);
         }
 
-        float appliedImpulse = desiredImpulse * Mathf.Clamp01(gate) * Mathf.Max(0f, sampleWeight);
+        // A3: the contact gate fades energy-injecting spring support on flickering
+        // contacts. The compression stop is purely dissipative, so it bypasses the
+        // gate; gating it under-damped hard landings during fade-in and the
+        // deepened spring launched the wheel afterwards.
+        float gatedImpulse = desiredImpulse * Mathf.Clamp01(gate);
+        if (stopCompressionImpulse > gatedImpulse) gatedImpulse = stopCompressionImpulse;
+        float appliedImpulse = gatedImpulse * Mathf.Max(0f, sampleWeight);
         if (appliedImpulse <= 1e-8f) return 0f;
 
         Vector3 impulse = appliedImpulse * contactNormal;

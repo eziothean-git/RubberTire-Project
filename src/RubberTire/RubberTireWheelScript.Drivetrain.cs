@@ -60,6 +60,12 @@ public partial class RubberTireWheelScript
         uiKeyGearDown = AddKey("Shift Down Key", "kGDn", KeyCode.PageDown);
     }
 
+    // B1: wheel-axis torque self-applied this step (drive+brake+test hook).
+    // The static friction solver feeds it forward instead of waiting a step
+    // for the disturbance estimator to learn it.
+    private float pendingDriveAxisTorque;
+    private Vector3 pendingDriveAxisWorld = Vector3.up;
+
     private void ApplyDriveBrake()
     {
         float dt = Time.fixedDeltaTime;
@@ -76,7 +82,14 @@ public partial class RubberTireWheelScript
         brake01 = Mathf.MoveTowards(brake01, targetBrk, brkRate * dt);
 
         Vector3 driveAxis = GetDriveAxisWorld();
-        float omegaAxis = Vector3.Dot(Rigidbody.angularVelocity, driveAxis);
+        float omegaAxisAbs = Vector3.Dot(Rigidbody.angularVelocity, driveAxis);
+        // B4: engine RPM and braking act on wheel spin RELATIVE to the joint
+        // parent, so chassis yaw/roll does not pollute the tachometer or the
+        // brake hold logic.
+        float omegaAxis = omegaAxisAbs;
+        Rigidbody parentBody = GetJointParentBody();
+        if (parentBody != null)
+            omegaAxis -= Vector3.Dot(parentBody.angularVelocity, driveAxis);
         float gearRatio = GetCurrentGearRatio();
         float engineRpm = Mathf.Abs(omegaAxis) * gearRatio * RpmPerRadPerSecond;
         float engineTorque = enableEngineCurve
@@ -100,8 +113,30 @@ public partial class RubberTireWheelScript
                 tau += Mathf.Clamp(-omegaAxis * brakeHoldK, -tauBMax, tauBMax);
         }
 
+        // A5: never pump the wheel past the spin cap; braking stays unlimited.
+        // The cap guards PhysX/joint stability, so it uses ABSOLUTE spin.
+        tau = ClampSpinPumpingTorque(tau, omegaAxisAbs, driveAxis, dt);
+        pendingDriveAxisTorque = tau;
+        pendingDriveAxisWorld = driveAxis;
         if (Mathf.Abs(tau) > 1e-6f)
             Rigidbody.AddTorque(driveAxis * tau, ForceMode.Force);
+    }
+
+    // A5: torque that spins the wheel further toward the hard cap is limited in
+    // velocity space so a single step can never push |omega| past the cap.
+    // Torque opposing the current spin (braking) is dissipative and never limited.
+    private float ClampSpinPumpingTorque(float tau, float omegaAxis, Vector3 axisWorld, float dt)
+    {
+        if (tau * omegaAxis <= 0f) return tau;
+
+        float headroom = GetSpinCap() - Mathf.Abs(omegaAxis);
+        if (headroom <= 0f) return 0f;
+
+        float inertia = GetInertiaAroundWorldAxis(axisWorld);
+        if (inertia <= 1e-6f) return tau;
+
+        float maxTau = inertia * headroom / Mathf.Max(1e-5f, dt);
+        return Mathf.Clamp(tau, -maxTau, maxTau);
     }
 
     internal float EvaluateEngineTorque(float engineRpm)
@@ -112,12 +147,8 @@ public partial class RubberTireWheelScript
 
         // T and P are independent controls. Their physically required
         // crossover is derived rather than exposed as a redundant parameter.
-        float baseOmega = peakPower / peakTorque;
-        float baseRpm = baseOmega * RpmPerRadPerSecond;
-        baseRpm = Mathf.Max(1f, baseRpm);
-
-        float powerHoldRpm = Mathf.Max(baseRpm, enginePowerHoldRpm);
-        float redlineRpm = Mathf.Max(powerHoldRpm + 1f, engineRedlineRpm);
+        float baseRpm, powerHoldRpm, redlineRpm;
+        GetEngineCurveBreakpoints(out baseRpm, out powerHoldRpm, out redlineRpm);
         float rpm = Mathf.Max(0f, engineRpm);
         if (rpm >= redlineRpm) return 0f;
 
@@ -142,6 +173,17 @@ public partial class RubberTireWheelScript
             (rpm - powerHoldRpm)
             / Mathf.Max(1f, redlineRpm - powerHoldRpm));
         return peakPower * falloff / omega;
+    }
+
+    // C5: single source of truth for the curve breakpoints; the factory UI
+    // draws its markers from the same values the torque evaluation uses.
+    internal void GetEngineCurveBreakpoints(out float baseRpm, out float powerHoldRpm, out float redlineRpm)
+    {
+        float peakTorque = Mathf.Max(1e-6f, enginePeakTorque);
+        float peakPower = Mathf.Max(0f, enginePeakPower);
+        baseRpm = Mathf.Max(1f, peakPower / peakTorque * RpmPerRadPerSecond);
+        powerHoldRpm = Mathf.Max(baseRpm, enginePowerHoldRpm);
+        redlineRpm = Mathf.Max(powerHoldRpm + 1f, engineRedlineRpm);
     }
 
     private float SmoothStep01(float value)

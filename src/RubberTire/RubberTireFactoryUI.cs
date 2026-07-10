@@ -1,8 +1,10 @@
+// The base game defines a global-namespace Slider type that shadows
+// UnityEngine.UI.Slider; alias explicitly.
+using UISlider = UnityEngine.UI.Slider;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using UnityEngine;
-using UnityEngine.Events;
 using UnityEngine.EventSystems;
 using UnityEngine.UI;
 using Besiege.UI;
@@ -15,16 +17,43 @@ public enum RubberTireChartKind
     None
 }
 
-internal sealed class RubberTireFloatBinding
+internal sealed class RubberTireSettingRow
 {
     public RubberTireFactorySetting Setting;
+    public GameObject Root;
     public InputField Input;
+    public UISlider Slider;
+    public Toggle Toggle;
+    public float LastShown = float.NaN;
+    public bool Suppress;
+    public string GroupKey;
 }
 
-internal sealed class RubberTireToggleBinding
+internal sealed class RubberTireGroupHeader
 {
-    public RubberTireFactorySetting Setting;
-    public Toggle Toggle;
+    public string Group;
+    public string GroupKey;
+    public GameObject Root;
+    public Text Label;
+    public bool AnyVisible;
+}
+
+// Hover helper implementing ONLY enter/exit: a full EventTrigger would also
+// swallow scroll/drag events and break the settings ScrollRect.
+internal sealed class RubberTireRowHover : MonoBehaviour, IPointerEnterHandler, IPointerExitHandler
+{
+    internal RubberTireFactoryUIController Controller;
+    internal RubberTireSettingRow Row;
+
+    public void OnPointerEnter(PointerEventData eventData)
+    {
+        if (Controller != null && Row != null) Controller.ShowTooltip(Row.Setting);
+    }
+
+    public void OnPointerExit(PointerEventData eventData)
+    {
+        if (Controller != null) Controller.ShowTooltip(null);
+    }
 }
 
 public sealed class RubberTireFactoryUIController : MonoBehaviour
@@ -32,21 +61,41 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
     private static readonly string[] Tabs =
         { "Engine", "Tire", "Support", "Contact", "Visual" };
 
+    private const string DefaultTooltip =
+        "Hover a row for details. F9 opens this panel during simulation (edits there tune live physics but are not saved to the machine).";
+
     private GameObject root;
     private RectTransform settingsContent;
     private Text chartTitle;
     private Text chartLegend;
+    private Text chartLive;
+    private Text contactLive;
+    private Text chartAxisLeft;
+    private Text chartAxisRight;
+    private Text chartAxisX;
+    private Text tooltipLabel;
+    private Text advancedButtonText;
     private RubberTireCurveGraphic chart;
     private RubberTireWheelScript target;
+    private RubberTireWheelScript simTarget;
     private string activeTab = "Engine";
     private bool readyRequested;
+    private bool hadRoot;
+    private bool simPanelOpen;
+    private bool commitPending;
     private float nextRefreshTime;
+    private float nextChartDirtyTime;
+    private float nextTargetScanTime;
+
+    // Session-wide UI preferences.
+    private static bool showAdvanced;
+    private static readonly HashSet<string> collapsedGroups = new HashSet<string>();
 
     private readonly List<Button> tabButtons = new List<Button>(8);
-    private readonly List<RubberTireFloatBinding> floatBindings =
-        new List<RubberTireFloatBinding>(64);
-    private readonly List<RubberTireToggleBinding> toggleBindings =
-        new List<RubberTireToggleBinding>(32);
+    private readonly List<RubberTireSettingRow> rows = new List<RubberTireSettingRow>(96);
+    private readonly List<RubberTireGroupHeader> headers = new List<RubberTireGroupHeader>(24);
+    private readonly Dictionary<string, RubberTireGroupHeader> headersByKey =
+        new Dictionary<string, RubberTireGroupHeader>(24, StringComparer.Ordinal);
 
     private static readonly Color PanelColor = new Color(0.055f, 0.065f, 0.075f, 0.97f);
     private static readonly Color RowColor = new Color(0.10f, 0.115f, 0.13f, 0.92f);
@@ -57,18 +106,43 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
     {
         if (root == null)
         {
+            if (hadRoot)
+            {
+                // E7: the UIFactory canvas (and our panel with it) died on a
+                // scene change. Drop stale references and allow a rebuild.
+                hadRoot = false;
+                readyRequested = false;
+                ClearUiReferences();
+            }
             TryBuildUI();
             return;
         }
+        hadRoot = true;
 
-        RubberTireWheelScript selected = FindSelectedWheel();
+        if (Input.GetKeyDown(KeyCode.F9))
+        {
+            simPanelOpen = !simPanelOpen;
+            nextTargetScanTime = 0f;
+        }
+
+        RubberTireWheelScript selected = ResolveTarget();
         if (selected != target)
         {
+            if (target != null && commitPending)
+            {
+                commitPending = false;
+                target.FactoryCommitSettings();
+            }
             target = selected;
             if (target != null)
             {
                 target.FactoryPullSettings();
-                RebuildSettings();
+                RebindRows();
+                chart.Target = target;
+                UpdateChartMode();
+                RefreshBindings();
+                ApplyRowVisibility();
+                UpdateChartTexts();
             }
         }
 
@@ -76,28 +150,73 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         if (root.activeSelf != visible) root.SetActive(visible);
         if (!visible) return;
 
-        target.FactoryPullSettings();
-        chart.Target = target;
-        chart.SetVerticesDirty();
-
         if (Time.unscaledTime >= nextRefreshTime)
         {
             nextRefreshTime = Time.unscaledTime + 0.20f;
+            target.FactoryPullSettings();
+            if (commitPending)
+            {
+                commitPending = false;
+                target.FactoryCommitSettings();
+            }
             RefreshBindings();
+            ApplyRowVisibility();
+            UpdateChartTexts();
+        }
+
+        // E8: the chart mesh is rebuilt only when parameters change or, during
+        // simulation, on a 10 Hz tick for the live work point.
+        if (target.IsSimulating
+            && chart.Kind != RubberTireChartKind.None
+            && Time.unscaledTime >= nextChartDirtyTime)
+        {
+            nextChartDirtyTime = Time.unscaledTime + 0.10f;
+            chart.SetVerticesDirty();
         }
     }
 
     private void TryBuildUI()
     {
-        if (readyRequested) return;
-        if (Make.Instance == null || Make.ScreenCanvas == null) return;
+        if (Make.Instance == null) return;
 
+        // E7: when the canvas already exists OnReady may have fired long ago
+        // and re-registering would never call back. Build directly.
+        if (Make.ScreenCanvas != null)
+        {
+            BuildUI();
+            return;
+        }
+
+        if (readyRequested) return;
         readyRequested = true;
         Make.OnReady("UIFactory3", BuildUI);
     }
 
+    private void ClearUiReferences()
+    {
+        target = null;
+        simTarget = null;
+        chart = null;
+        settingsContent = null;
+        chartTitle = null;
+        chartLegend = null;
+        chartLive = null;
+        contactLive = null;
+        chartAxisLeft = null;
+        chartAxisRight = null;
+        chartAxisX = null;
+        tooltipLabel = null;
+        advancedButtonText = null;
+        tabButtons.Clear();
+        rows.Clear();
+        headers.Clear();
+        headersByKey.Clear();
+    }
+
     private void BuildUI()
     {
+        if (root != null) return;
+
         root = Make.Prefab("UIFactory3", "Panel", Make.ScreenCanvas.transform);
         root.name = "Rubber Tire Lab";
         RectTransform rootRect = root.GetComponent<RectTransform>();
@@ -111,7 +230,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
 
         CreateText(root.transform, "RUBBER TIRE LAB", 22, FontStyle.Bold,
             new Vector2(18f, -12f), new Vector2(500f, 34f), TextAnchor.MiddleLeft, Color.white);
-        CreateText(root.transform, "UIFactory workspace · one native machine-data record",
+        CreateText(root.transform, "UIFactory workspace  |  F9 = live panel in simulation",
             12, FontStyle.Normal, new Vector2(450f, -14f), new Vector2(408f, 30f),
             TextAnchor.MiddleRight, MutedColor);
 
@@ -132,7 +251,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
             "Settings Viewport",
             root.transform,
             new Vector2(18f, -102f),
-            new Vector2(330f, 514f));
+            new Vector2(330f, 440f));
         Image viewportImage = viewport.gameObject.AddComponent<Image>();
         viewportImage.color = new Color(0.025f, 0.03f, 0.035f, 0.75f);
         Mask mask = viewport.gameObject.AddComponent<Mask>();
@@ -165,6 +284,29 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         scroll.movementType = ScrollRect.MovementType.Clamped;
         scroll.scrollSensitivity = 28f;
 
+        // E3/E4: workspace actions under the settings list.
+        Button resetButton = CreateButton(root.transform, "Reset Tab",
+            new Vector2(18f, -550f), new Vector2(102f, 26f));
+        resetButton.onClick.AddListener(delegate { ResetActiveTab(); });
+
+        Button applyAllButton = CreateButton(root.transform, "Apply to All",
+            new Vector2(126f, -550f), new Vector2(110f, 26f));
+        applyAllButton.onClick.AddListener(delegate { ApplyToAllWheels(); });
+
+        Button advancedButton = CreateButton(root.transform, "Adv: Off",
+            new Vector2(242f, -550f), new Vector2(106f, 26f));
+        advancedButtonText = advancedButton.GetComponentInChildren<Text>();
+        advancedButton.onClick.AddListener(delegate
+        {
+            showAdvanced = !showAdvanced;
+            UpdateAdvancedButton();
+            ApplyRowVisibility();
+        });
+        UpdateAdvancedButton();
+
+        tooltipLabel = CreateText(root.transform, DefaultTooltip, 11, FontStyle.Normal,
+            new Vector2(18f, -582f), new Vector2(330f, 50f), TextAnchor.UpperLeft, MutedColor);
+
         RectTransform chartPanel = CreateRectObject(
             "Chart Panel",
             root.transform,
@@ -176,25 +318,63 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         chartTitle = CreateText(chartPanel, "", 18, FontStyle.Bold,
             new Vector2(16f, -10f), new Vector2(464f, 28f), TextAnchor.MiddleLeft, Color.white);
         chartLegend = CreateText(chartPanel, "", 12, FontStyle.Normal,
-            new Vector2(16f, -40f), new Vector2(464f, 40f), TextAnchor.UpperLeft, MutedColor);
+            new Vector2(16f, -40f), new Vector2(464f, 32f), TextAnchor.UpperLeft, MutedColor);
 
         RectTransform chartRect = CreateRectObject(
             "Curve Graphic",
             chartPanel,
-            new Vector2(18f, -88f),
-            new Vector2(460f, 402f));
+            new Vector2(18f, -84f),
+            new Vector2(460f, 386f));
         chart = chartRect.gameObject.AddComponent<RubberTireCurveGraphic>();
         chart.raycastTarget = false;
+
+        // E6: numeric context for the mesh-only chart.
+        chartAxisLeft = CreateText(chartPanel, "", 11, FontStyle.Normal,
+            new Vector2(18f, -72f), new Vector2(230f, 16f), TextAnchor.MiddleLeft, AccentColor);
+        chartAxisRight = CreateText(chartPanel, "", 11, FontStyle.Normal,
+            new Vector2(248f, -72f), new Vector2(230f, 16f), TextAnchor.MiddleRight,
+            new Color(1f, 0.58f, 0.18f, 1f));
+        chartAxisX = CreateText(chartPanel, "", 11, FontStyle.Normal,
+            new Vector2(18f, -470f), new Vector2(460f, 16f), TextAnchor.MiddleRight, MutedColor);
+
+        chartLive = CreateText(chartPanel, "", 13, FontStyle.Bold,
+            new Vector2(16f, -488f), new Vector2(464f, 22f), TextAnchor.MiddleLeft, Color.white);
+
+        contactLive = CreateText(chartPanel, "", 12, FontStyle.Normal,
+            new Vector2(18f, -96f), new Vector2(440f, 360f), TextAnchor.UpperLeft, Color.white);
 
         root.SetActive(false);
         SelectTab(activeTab);
     }
 
-    private RubberTireWheelScript FindSelectedWheel()
+    private RubberTireWheelScript ResolveTarget()
     {
-        if (!BlockMapper.IsOpen || BlockMapper.CurrentInstance == null) return null;
-        if (BlockMapper.CurrentInstance.Block == null) return null;
-        return BlockMapper.CurrentInstance.Block.GetComponent<RubberTireWheelScript>();
+        if (BlockMapper.IsOpen && BlockMapper.CurrentInstance != null
+            && BlockMapper.CurrentInstance.Block != null)
+        {
+            return BlockMapper.CurrentInstance.Block.GetComponent<RubberTireWheelScript>();
+        }
+
+        // E5: simulation-time live panel. Build-mode data does not simulate, so
+        // pick a simulating wheel instance instead.
+        if (!simPanelOpen) return null;
+        if (simTarget != null && simTarget.IsSimulating) return simTarget;
+        if (Time.unscaledTime >= nextTargetScanTime)
+        {
+            nextTargetScanTime = Time.unscaledTime + 1f;
+            simTarget = FindSimulatingWheel();
+        }
+        return simTarget;
+    }
+
+    private RubberTireWheelScript FindSimulatingWheel()
+    {
+        RubberTireWheelScript[] wheels = UnityEngine.Object.FindObjectsOfType<RubberTireWheelScript>();
+        for (int i = 0; i < wheels.Length; i++)
+        {
+            if (wheels[i] != null && wheels[i].IsSimulating) return wheels[i];
+        }
+        return null;
     }
 
     private void SelectTab(string tab)
@@ -209,8 +389,9 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
                     : new Color(0.12f, 0.14f, 0.16f, 1f);
         }
 
-        if (target != null) RebuildSettings();
+        ApplyRowVisibility();
         UpdateChartMode();
+        UpdateChartTexts();
     }
 
     private void UpdateChartMode()
@@ -220,144 +401,536 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         {
             chart.Kind = RubberTireChartKind.Engine;
             chartTitle.text = "ENGINE TORQUE / POWER";
-            chartLegend.text = "CYAN  torque     ORANGE  power     WHITE  live RPM";
+            chartLegend.text = "CYAN torque    ORANGE power    WHITE live RPM    thin verticals: base / hold";
         }
         else if (activeTab == "Tire")
         {
             chart.Kind = RubberTireChartKind.Tire;
             chartTitle.text = "COMBINED FRICTION ELLIPSE";
-            chartLegend.text = "CYAN  static limit     ORANGE  kinetic limit     WHITE  live Fx/Fn, Fy/Fn\nHorizontal: longitudinal force. Vertical: lateral force. Both use one common scale.";
+            chartLegend.text = "CYAN static limit    ORANGE kinetic limit    WHITE live Fx/Fn, Fy/Fn";
         }
         else if (activeTab == "Support")
         {
             chart.Kind = RubberTireChartKind.Support;
             chartTitle.text = "SUPPORT FORCE / PENETRATION";
-            chartLegend.text = "CYAN  spring branch at zero normal velocity\nRebound damping and the mass-aware recovery cap act dynamically.";
+            chartLegend.text = "CYAN spring branch at zero normal velocity";
         }
         else
         {
             chart.Kind = RubberTireChartKind.None;
             chartTitle.text = activeTab == "Contact" ? "CONTACT PIPELINE" : "DEBUG VISUALS";
             chartLegend.text = activeTab == "Contact"
-                ? "All-layer ray query → per-collider hit aggregation → point support → body patch friction"
+                ? "Radial all-layer rays -> per-collider aggregation -> point support -> body patch friction"
                 : "These controls affect diagnostics only; physical parameters live in the other pages.";
         }
+        if (contactLive != null && activeTab != "Contact") contactLive.text = "";
         chart.SetVerticesDirty();
     }
 
-    private void RebuildSettings()
-    {
-        if (settingsContent == null || target == null) return;
+    // =========================
+    // Rows
+    // =========================
 
+    private void RebindRows()
+    {
+        List<RubberTireFactorySetting> settings = target.GetFactorySettings();
+        if (rows.Count != settings.Count)
+        {
+            BuildRows(settings);
+            return;
+        }
+
+        // Every wheel builds an identical settings layout; rows are reused and
+        // only the delegate targets change.
+        for (int i = 0; i < rows.Count; i++)
+        {
+            rows[i].Setting = settings[i];
+            rows[i].LastShown = float.NaN;
+        }
+    }
+
+    private void BuildRows(List<RubberTireFactorySetting> settings)
+    {
         for (int i = settingsContent.childCount - 1; i >= 0; i--)
             Destroy(settingsContent.GetChild(i).gameObject);
-        floatBindings.Clear();
-        toggleBindings.Clear();
+        rows.Clear();
+        headers.Clear();
+        headersByKey.Clear();
 
-        List<RubberTireFactorySetting> settings = target.BuildFactorySettings();
+        string previousKey = null;
         for (int i = 0; i < settings.Count; i++)
         {
             RubberTireFactorySetting setting = settings[i];
-            if (setting.Tab != activeTab) continue;
-            if (setting.IsToggle) CreateToggleRow(setting);
-            else CreateFloatRow(setting);
+            string groupKey = setting.Tab + "/" + setting.Group;
+            if (!String.Equals(groupKey, previousKey, StringComparison.Ordinal))
+            {
+                previousKey = groupKey;
+                if (!headersByKey.ContainsKey(groupKey))
+                    CreateGroupHeader(setting.Group, groupKey);
+            }
+            rows.Add(setting.IsToggle
+                ? CreateToggleRow(setting, groupKey)
+                : CreateFloatRow(setting, groupKey));
         }
-
-        UpdateChartMode();
-        Canvas.ForceUpdateCanvases();
     }
 
-    private void CreateFloatRow(RubberTireFactorySetting setting)
+    private void CreateGroupHeader(string group, string groupKey)
     {
-        RectTransform row = CreateRectObject(
-            setting.Label,
-            settingsContent,
-            Vector2.zero,
-            new Vector2(313f, 38f));
-        LayoutElement element = row.gameObject.AddComponent<LayoutElement>();
-        element.preferredHeight = 38f;
-        Image bg = row.gameObject.AddComponent<Image>();
+        RubberTireGroupHeader header = new RubberTireGroupHeader();
+        header.Group = group;
+        header.GroupKey = groupKey;
+
+        RectTransform rect = CreateRectObject("H_" + groupKey, settingsContent,
+            Vector2.zero, new Vector2(313f, 22f));
+        header.Root = rect.gameObject;
+        LayoutElement element = rect.gameObject.AddComponent<LayoutElement>();
+        element.preferredHeight = 22f;
+        Image bg = rect.gameObject.AddComponent<Image>();
+        bg.color = new Color(0.07f, 0.09f, 0.11f, 1f);
+        Button button = rect.gameObject.AddComponent<Button>();
+        button.targetGraphic = bg;
+        header.Label = CreateText(rect, "- " + group.ToUpperInvariant(), 11, FontStyle.Bold,
+            new Vector2(8f, -2f), new Vector2(297f, 18f), TextAnchor.MiddleLeft, AccentColor);
+
+        string capturedKey = groupKey;
+        button.onClick.AddListener(delegate
+        {
+            if (!collapsedGroups.Remove(capturedKey)) collapsedGroups.Add(capturedKey);
+            ApplyRowVisibility();
+        });
+
+        headers.Add(header);
+        headersByKey.Add(groupKey, header);
+    }
+
+    private RubberTireSettingRow CreateFloatRow(RubberTireFactorySetting setting, string groupKey)
+    {
+        RubberTireSettingRow row = new RubberTireSettingRow();
+        row.Setting = setting;
+        row.GroupKey = groupKey;
+
+        RectTransform rect = CreateRectObject(setting.Key, settingsContent,
+            Vector2.zero, new Vector2(313f, 52f));
+        row.Root = rect.gameObject;
+        LayoutElement element = rect.gameObject.AddComponent<LayoutElement>();
+        element.preferredHeight = 52f;
+        Image bg = rect.gameObject.AddComponent<Image>();
         bg.color = RowColor;
 
-        CreateText(row, setting.Label, 12, FontStyle.Normal,
-            new Vector2(10f, -1f), new Vector2(205f, 36f), TextAnchor.MiddleLeft, Color.white);
+        CreateText(rect, setting.Label, 11, FontStyle.Normal,
+            new Vector2(10f, -2f), new Vector2(210f, 22f), TextAnchor.MiddleLeft, Color.white);
 
-        GameObject inputObject = Make.Prefab("UIFactory3", "Input Field", row);
+        GameObject inputObject = Make.Prefab("UIFactory3", "Input Field", rect);
         RectTransform inputRect = inputObject.GetComponent<RectTransform>();
-        SetTopLeftRect(inputRect, new Vector2(220f, -5f), new Vector2(83f, 28f));
-        InputField input = inputObject.GetComponent<InputField>();
-        input.contentType = InputField.ContentType.DecimalNumber;
-        input.text = FormatValue(setting.GetFloat());
+        SetTopLeftRect(inputRect, new Vector2(224f, -3f), new Vector2(81f, 22f));
+        row.Input = inputObject.GetComponent<InputField>();
+        row.Input.contentType = InputField.ContentType.DecimalNumber;
+        row.Input.text = FormatValue(setting.GetFloat());
 
-        RubberTireFactorySetting captured = setting;
-        input.onEndEdit.AddListener(delegate(string text)
+        row.Slider = CreateSlider(rect, new Vector2(10f, -31f), new Vector2(295f, 16f));
+        row.Suppress = true;
+        row.Slider.value = ValueToSlider(setting, setting.GetFloat());
+        row.Suppress = false;
+
+        RubberTireSettingRow captured = row;
+        row.Slider.onValueChanged.AddListener(delegate(float u)
         {
-            float value;
-            if (TryParseValue(text, out value))
-                captured.SetFloat(Mathf.Clamp(value, captured.Min, captured.Max));
-            input.text = FormatValue(captured.GetFloat());
+            if (captured.Suppress) return;
+            float value = SliderToValue(captured.Setting, u);
+            if (!ValueDiffers(captured.Setting.GetFloat(), value)) return;
+            captured.Setting.SetFloat(value);
+            captured.LastShown = captured.Setting.GetFloat();
+            if (captured.Input != null && !InputHasFocus(captured.Input))
+                captured.Input.text = FormatValue(captured.LastShown);
             OnSettingChanged();
         });
 
-        RubberTireFloatBinding binding = new RubberTireFloatBinding();
-        binding.Setting = setting;
-        binding.Input = input;
-        floatBindings.Add(binding);
+        row.Input.onEndEdit.AddListener(delegate(string text)
+        {
+            float parsed;
+            if (TryParseValue(text, out parsed))
+            {
+                float clamped = Mathf.Clamp(parsed, captured.Setting.Min, captured.Setting.Max);
+                // E8: write back only when the value truly differs, so the
+                // rounded display text can never degrade stored precision.
+                if (ValueDiffers(captured.Setting.GetFloat(), clamped))
+                {
+                    captured.Setting.SetFloat(clamped);
+                    OnSettingChanged();
+                }
+            }
+            captured.LastShown = float.NaN;
+            RefreshRow(captured);
+        });
+
+        AddHoverTooltip(rect.gameObject, row);
+        return row;
     }
 
-    private void CreateToggleRow(RubberTireFactorySetting setting)
+    private RubberTireSettingRow CreateToggleRow(RubberTireFactorySetting setting, string groupKey)
     {
+        RubberTireSettingRow row = new RubberTireSettingRow();
+        row.Setting = setting;
+        row.GroupKey = groupKey;
+
         GameObject toggleObject = Make.Prefab("UIFactory3", "Text Toggle", settingsContent);
-        toggleObject.name = setting.Label;
+        toggleObject.name = setting.Key;
+        row.Root = toggleObject;
         RectTransform rect = toggleObject.GetComponent<RectTransform>();
-        rect.sizeDelta = new Vector2(313f, 38f);
+        rect.sizeDelta = new Vector2(313f, 34f);
         LayoutElement element = toggleObject.GetComponent<LayoutElement>();
         if (element == null) element = toggleObject.AddComponent<LayoutElement>();
-        element.preferredHeight = 38f;
+        element.preferredHeight = 34f;
         Image bg = toggleObject.GetComponent<Image>();
         if (bg != null) bg.color = RowColor;
 
         Text label = toggleObject.GetComponentInChildren<Text>();
         if (label != null) label.text = setting.Label;
-        Toggle toggle = toggleObject.GetComponent<Toggle>();
-        toggle.isOn = setting.GetBool();
+        row.Toggle = toggleObject.GetComponent<Toggle>();
+        row.Toggle.isOn = setting.GetBool();
 
-        RubberTireFactorySetting captured = setting;
-        toggle.onValueChanged.AddListener(delegate(bool value)
+        RubberTireSettingRow captured = row;
+        row.Toggle.onValueChanged.AddListener(delegate(bool value)
         {
-            captured.SetBool(value);
+            if (captured.Suppress) return;
+            if (captured.Setting.GetBool() == value) return;
+            captured.Setting.SetBool(value);
             OnSettingChanged();
+            // Dependent rows (When conditions) may have flipped.
+            ApplyRowVisibility();
         });
 
-        RubberTireToggleBinding binding = new RubberTireToggleBinding();
-        binding.Setting = setting;
-        binding.Toggle = toggle;
-        toggleBindings.Add(binding);
+        AddHoverTooltip(toggleObject, row);
+        return row;
+    }
+
+    private void AddHoverTooltip(GameObject rowObject, RubberTireSettingRow row)
+    {
+        RubberTireRowHover hover = rowObject.AddComponent<RubberTireRowHover>();
+        hover.Controller = this;
+        hover.Row = row;
+    }
+
+    internal void ShowTooltip(RubberTireFactorySetting setting)
+    {
+        if (tooltipLabel == null) return;
+        if (setting == null)
+        {
+            tooltipLabel.text = DefaultTooltip;
+            return;
+        }
+
+        string text = setting.Tooltip;
+        if (!setting.IsToggle)
+        {
+            string range = "Range " + FormatValue(setting.Min) + " - " + FormatValue(setting.Max)
+                         + "  |  default " + FormatValue(setting.DefaultFloat);
+            text = String.IsNullOrEmpty(text) ? range : text + "\n" + range;
+        }
+        else if (String.IsNullOrEmpty(text))
+        {
+            text = setting.Label + "  |  default " + (setting.DefaultBool ? "on" : "off");
+        }
+        tooltipLabel.text = text;
     }
 
     private void OnSettingChanged()
     {
-        if (target != null) target.FactoryCommitSettings();
+        // Commit is batched onto the 0.2 s tick (and flushed on target switch)
+        // so slider drags do not serialize the whole record per event.
+        commitPending = true;
         if (chart != null) chart.SetVerticesDirty();
+    }
+
+    private void ResetActiveTab()
+    {
+        if (target == null) return;
+        target.FactoryResetTab(activeTab);
+        commitPending = false;
+        ForceRefresh();
+    }
+
+    private void ApplyToAllWheels()
+    {
+        if (target == null) return;
+        if (commitPending)
+        {
+            commitPending = false;
+            target.FactoryCommitSettings();
+        }
+
+        RubberTireWheelScript[] wheels = UnityEngine.Object.FindObjectsOfType<RubberTireWheelScript>();
+        Transform machineRoot = target.transform.root;
+        for (int i = 0; i < wheels.Length; i++)
+        {
+            RubberTireWheelScript wheel = wheels[i];
+            if (wheel == null || wheel == target) continue;
+            if (wheel.transform.root != machineRoot) continue;
+            wheel.FactoryApplyConfigFrom(target);
+        }
+    }
+
+    private void UpdateAdvancedButton()
+    {
+        if (advancedButtonText != null)
+            advancedButtonText.text = showAdvanced ? "Adv: On" : "Adv: Off";
+    }
+
+    private void ForceRefresh()
+    {
+        for (int i = 0; i < rows.Count; i++) rows[i].LastShown = float.NaN;
+        RefreshBindings();
+        ApplyRowVisibility();
+        if (chart != null) chart.SetVerticesDirty();
+        UpdateChartTexts();
     }
 
     private void RefreshBindings()
     {
-        for (int i = 0; i < floatBindings.Count; i++)
+        for (int i = 0; i < rows.Count; i++) RefreshRow(rows[i]);
+    }
+
+    private void RefreshRow(RubberTireSettingRow row)
+    {
+        if (row.Setting.IsToggle)
         {
-            RubberTireFloatBinding binding = floatBindings[i];
-            float value = binding.Setting.GetFloat();
-            if (!InputHasFocus(binding.Input))
-                binding.Input.text = FormatValue(value);
+            if (row.Toggle == null) return;
+            bool value = row.Setting.GetBool();
+            if (row.Toggle.isOn != value)
+            {
+                row.Suppress = true;
+                row.Toggle.isOn = value;
+                row.Suppress = false;
+            }
+            return;
         }
 
-        for (int i = 0; i < toggleBindings.Count; i++)
+        float current = row.Setting.GetFloat();
+        float epsilon = Mathf.Max(1e-6f, Mathf.Abs(current) * 1e-5f);
+        // NaN in LastShown (forced refresh) falls through the comparison.
+        if (Mathf.Abs(row.LastShown - current) <= epsilon) return;
+        row.LastShown = current;
+        if (row.Input != null && !InputHasFocus(row.Input))
+            row.Input.text = FormatValue(current);
+        if (row.Slider != null)
         {
-            RubberTireToggleBinding binding = toggleBindings[i];
-            bool value = binding.Setting.GetBool();
-            if (binding.Toggle.isOn != value) binding.Toggle.isOn = value;
+            row.Suppress = true;
+            row.Slider.value = ValueToSlider(row.Setting, current);
+            row.Suppress = false;
         }
     }
+
+    private void ApplyRowVisibility()
+    {
+        if (rows.Count == 0) return;
+
+        for (int i = 0; i < headers.Count; i++) headers[i].AnyVisible = false;
+
+        for (int i = 0; i < rows.Count; i++)
+        {
+            RubberTireSettingRow row = rows[i];
+            RubberTireFactorySetting setting = row.Setting;
+            bool pass = String.Equals(setting.Tab, activeTab, StringComparison.Ordinal)
+                && (!setting.Advanced || showAdvanced)
+                && (setting.VisibleWhen == null || setting.VisibleWhen());
+            if (pass)
+            {
+                RubberTireGroupHeader groupHeader;
+                if (headersByKey.TryGetValue(row.GroupKey, out groupHeader))
+                    groupHeader.AnyVisible = true;
+            }
+            bool shown = pass && !collapsedGroups.Contains(row.GroupKey);
+            if (row.Root != null && row.Root.activeSelf != shown)
+                row.Root.SetActive(shown);
+        }
+
+        for (int i = 0; i < headers.Count; i++)
+        {
+            RubberTireGroupHeader header = headers[i];
+            if (header.Root == null) continue;
+            if (header.Root.activeSelf != header.AnyVisible)
+                header.Root.SetActive(header.AnyVisible);
+            if (header.AnyVisible && header.Label != null)
+            {
+                string text = (collapsedGroups.Contains(header.GroupKey) ? "+ " : "- ")
+                            + header.Group.ToUpperInvariant();
+                if (header.Label.text != text) header.Label.text = text;
+            }
+        }
+    }
+
+    // =========================
+    // Chart context texts (E6)
+    // =========================
+
+    private void UpdateChartTexts()
+    {
+        if (target == null || chart == null || chartAxisLeft == null) return;
+
+        if (chart.Kind == RubberTireChartKind.Engine)
+        {
+            float baseRpm, holdRpm, redlineRpm;
+            target.GetEngineCurveBreakpoints(out baseRpm, out holdRpm, out redlineRpm);
+            float maxTorque = 1e-4f;
+            float maxPower = 1e-4f;
+            const int samples = 48;
+            for (int i = 0; i <= samples; i++)
+            {
+                float torque, power;
+                target.FactoryEnginePoint(redlineRpm * i / samples, out torque, out power);
+                if (torque > maxTorque) maxTorque = torque;
+                if (power > maxPower) maxPower = power;
+            }
+            chartAxisLeft.text = "T max " + maxTorque.ToString("0") + " Nm";
+            chartAxisRight.text = "P max " + (maxPower / 1000f).ToString("0.#") + " kW";
+            chartAxisX.text = "0 - " + redlineRpm.ToString("0") + " RPM  (base "
+                + baseRpm.ToString("0") + ", hold " + holdRpm.ToString("0") + ")";
+        }
+        else if (chart.Kind == RubberTireChartKind.Support)
+        {
+            chartAxisLeft.text = "F max " + target.FactorySupportForce(0.25f).ToString("0") + " N";
+            chartAxisRight.text = "";
+            chartAxisX.text = "penetration 0 - 0.25 m";
+        }
+        else if (chart.Kind == RubberTireChartKind.Tire)
+        {
+            float staticLong, staticLat, kineticLong, kineticLat;
+            target.FactoryFrictionEllipse(false, out staticLong, out staticLat);
+            target.FactoryFrictionEllipse(true, out kineticLong, out kineticLat);
+            chartAxisLeft.text = "static " + staticLong.ToString("0.##") + " / " + staticLat.ToString("0.##");
+            chartAxisRight.text = "kinetic " + kineticLong.ToString("0.##") + " / " + kineticLat.ToString("0.##");
+            chartAxisX.text = "x longitudinal, y lateral";
+        }
+        else
+        {
+            chartAxisLeft.text = "";
+            chartAxisRight.text = "";
+            chartAxisX.text = "";
+        }
+
+        UpdateLiveStrip();
+    }
+
+    private void UpdateLiveStrip()
+    {
+        if (chartLive == null) return;
+        if (!target.IsSimulating)
+        {
+            chartLive.text = simPanelOpen ? "not simulating" : "";
+            if (contactLive != null && activeTab == "Contact") contactLive.text = "";
+            return;
+        }
+
+        if (chart.Kind == RubberTireChartKind.Engine)
+        {
+            chartLive.text = "GEAR " + target.FactoryCurrentGear()
+                + "   THR " + Mathf.RoundToInt(target.FactoryThrottle01() * 100f) + "%"
+                + "   BRK " + Mathf.RoundToInt(target.FactoryBrake01() * 100f) + "%"
+                + "   RPM " + Mathf.Max(0f, target.FactoryCurrentEngineRpm()).ToString("0");
+        }
+        else if (chart.Kind == RubberTireChartKind.Tire)
+        {
+            float longitudinal, lateral;
+            target.FactoryCurrentFrictionPoint(out longitudinal, out lateral);
+            int contactCount;
+            float totalLoad;
+            target.FactoryLiveContactSummary(out contactCount, out totalLoad);
+            chartLive.text = "Fx/Fn " + longitudinal.ToString("0.00")
+                + "   Fy/Fn " + lateral.ToString("0.00")
+                + "   load " + totalLoad.ToString("0") + " N";
+        }
+        else
+        {
+            int contactCount;
+            float totalLoad;
+            target.FactoryLiveContactSummary(out contactCount, out totalLoad);
+            chartLive.text = "contacts " + contactCount + "   load " + totalLoad.ToString("0") + " N";
+        }
+
+        if (contactLive != null && activeTab == "Contact")
+        {
+            int count = target.FactoryContactSampleCount();
+            string text = "live samples: " + count;
+            for (int i = 0; i < count; i++)
+            {
+                float pen, gate;
+                target.FactoryContactSample(i, out pen, out gate);
+                text += "\n#" + i + "  pen " + pen.ToString("0.000") + " m   gate " + gate.ToString("0.00");
+            }
+            contactLive.text = text;
+        }
+    }
+
+    // =========================
+    // Slider mapping (E1)
+    // =========================
+
+    private static float SliderToValue(RubberTireFactorySetting setting, float u)
+    {
+        u = Mathf.Clamp01(u);
+        // Cubic response gives fine control near the low end of wide ranges
+        // while still reaching Max; works with Min = 0 where log scales fail.
+        if (setting.Curved) u = u * u * u;
+        return setting.Min + (setting.Max - setting.Min) * u;
+    }
+
+    private static float ValueToSlider(RubberTireFactorySetting setting, float value)
+    {
+        float span = setting.Max - setting.Min;
+        if (span <= 1e-8f) return 0f;
+        float u = Mathf.Clamp01((value - setting.Min) / span);
+        if (setting.Curved) u = Mathf.Pow(u, 1f / 3f);
+        return u;
+    }
+
+    private static bool ValueDiffers(float a, float b)
+    {
+        return Mathf.Abs(a - b) > Mathf.Max(1e-6f, Mathf.Abs(a) * 1e-5f);
+    }
+
+    private UISlider CreateSlider(Transform parent, Vector2 topLeft, Vector2 size)
+    {
+        RectTransform rect = CreateRectObject("Slider", parent, topLeft, size);
+
+        GameObject trackObject = new GameObject("Track", typeof(RectTransform), typeof(CanvasRenderer), typeof(Image));
+        trackObject.layer = rect.gameObject.layer;
+        RectTransform trackRect = trackObject.GetComponent<RectTransform>();
+        trackRect.SetParent(rect, false);
+        trackRect.anchorMin = new Vector2(0f, 0.5f);
+        trackRect.anchorMax = new Vector2(1f, 0.5f);
+        trackRect.pivot = new Vector2(0.5f, 0.5f);
+        trackRect.anchoredPosition = Vector2.zero;
+        trackRect.sizeDelta = new Vector2(0f, 4f);
+        trackObject.GetComponent<Image>().color = new Color(0.16f, 0.19f, 0.22f, 1f);
+
+        GameObject handleArea = new GameObject("Handle Slide Area", typeof(RectTransform));
+        handleArea.layer = rect.gameObject.layer;
+        RectTransform handleAreaRect = handleArea.GetComponent<RectTransform>();
+        handleAreaRect.SetParent(rect, false);
+        handleAreaRect.anchorMin = Vector2.zero;
+        handleAreaRect.anchorMax = Vector2.one;
+        handleAreaRect.sizeDelta = new Vector2(-10f, 0f);
+        handleAreaRect.anchoredPosition = Vector2.zero;
+
+        GameObject handleObject = new GameObject("Handle", typeof(RectTransform), typeof(CanvasRenderer), typeof(Image));
+        handleObject.layer = rect.gameObject.layer;
+        RectTransform handleRect = handleObject.GetComponent<RectTransform>();
+        handleRect.SetParent(handleAreaRect, false);
+        handleRect.sizeDelta = new Vector2(10f, 14f);
+        Image handleImage = handleObject.GetComponent<Image>();
+        handleImage.color = AccentColor;
+
+        UISlider slider = rect.gameObject.AddComponent<UISlider>();
+        slider.targetGraphic = handleImage;
+        slider.handleRect = handleRect;
+        slider.minValue = 0f;
+        slider.maxValue = 1f;
+        return slider;
+    }
+
+    // =========================
+    // Shared helpers
+    // =========================
 
     private static bool InputHasFocus(InputField input)
     {
@@ -416,7 +989,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         TextAnchor alignment,
         Color color)
     {
-        GameObject go = new GameObject(value, typeof(RectTransform), typeof(CanvasRenderer), typeof(Text));
+        GameObject go = new GameObject("T", typeof(RectTransform), typeof(CanvasRenderer), typeof(Text));
         go.layer = parent.gameObject.layer;
         RectTransform rect = go.GetComponent<RectTransform>();
         rect.SetParent(parent, false);
@@ -458,6 +1031,7 @@ public sealed class RubberTireCurveGraphic : MaskableGraphic
     public RubberTireChartKind Kind;
 
     private static readonly Color GridColor = new Color(0.28f, 0.32f, 0.35f, 0.36f);
+    private static readonly Color MarkerColor = new Color(0.55f, 0.62f, 0.68f, 0.55f);
     private static readonly Color Cyan = new Color(0.20f, 0.84f, 0.94f, 1f);
     private static readonly Color Orange = new Color(1f, 0.58f, 0.18f, 1f);
     private static readonly Color White = new Color(0.94f, 0.96f, 0.98f, 0.9f);
@@ -499,7 +1073,11 @@ public sealed class RubberTireCurveGraphic : MaskableGraphic
 
     private void DrawEngine(VertexHelper vh, Rect r)
     {
-        float maxRpm = Mathf.Max(1f, Target.FactoryEngineRedlineRpm());
+        // C5/E6: breakpoints come from the same source the physics uses.
+        float baseRpm, holdRpm, redlineRpm;
+        Target.GetEngineCurveBreakpoints(out baseRpm, out holdRpm, out redlineRpm);
+        float maxRpm = Mathf.Max(1f, redlineRpm);
+
         const int samples = 96;
         float maxTorque = 1e-4f;
         float maxPower = 1e-4f;
@@ -511,6 +1089,9 @@ public sealed class RubberTireCurveGraphic : MaskableGraphic
             maxTorque = Mathf.Max(maxTorque, torque);
             maxPower = Mathf.Max(maxPower, power);
         }
+
+        AddLine(vh, Plot(r, baseRpm / maxRpm, 0f), Plot(r, baseRpm / maxRpm, 1f), 1f, MarkerColor);
+        AddLine(vh, Plot(r, holdRpm / maxRpm, 0f), Plot(r, holdRpm / maxRpm, 1f), 1f, MarkerColor);
 
         Vector2 previousTorque = Vector2.zero;
         Vector2 previousPower = Vector2.zero;
