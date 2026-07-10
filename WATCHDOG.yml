@@ -1,0 +1,3 @@
+advisors: 
+  - name: default
+    model: litellm/aliyaochi/deepseek-v4-pro

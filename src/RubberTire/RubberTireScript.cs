@@ -20,6 +20,11 @@ public class RubberTireWheelScript : BlockScript
     public float springK = 3000f;          // 法向弹簧刚度
     public float damperC = 25f;            // 法向阻尼
     public float maxNormalForce = 200000f; // 单点法向力上限（多点时每点各自 clamp）
+    public bool enableStableNormalSupport = true;  // true: velocity-level support for low physics rates
+    public float normalSupportERP = 0.35f;          // penetration fraction corrected per fixed step
+    public float normalSupportVelDamping = 1.0f;    // relative normal velocity damping gain
+    public float normalSupportMassScale = 4.0f;     // virtual mass for connected contraptions
+    public float normalSupportSlop = 0.005f;        // ignored penetration before ERP correction
 
     public bool enableTireModel = true;
 
@@ -30,6 +35,22 @@ public class RubberTireWheelScript : BlockScript
     public float muKinetic = 1.20f;
     public float vStatic = 0.25f;
     public float forceFilterTau = 0.03f;
+
+    // Upgrade gates. Single-pass load scaling fixes legacy double attenuation and defaults ON;
+    // riskier tire model changes stay OFF until tuned in game.
+    public bool enableSinglePassLoadScaling = true;  // true: apply gate/sample weight once before tire clamp/filter
+    public bool enableCombinedSlipFriction = false;  // true: longitudinal/lateral friction ellipse
+    public float longitudinalGripScale = 1.0f;
+    public float lateralGripScale = 1.0f;
+
+    // Modern low-speed tire stabilization: creep/static grip + wheel-axis damping.
+    public bool enableModernLowSpeedTire = true;
+    public float lowSpeedRelaxSpeedFloor = 1.0f; // m/s, prevents relaxation time from exploding near standstill
+    public float lowSpeedCreepSpeed = 0.15f;     // m/s, slip speed that reaches static-friction creep demand
+    public float lowSpeedCreepBlend = 0.75f;     // m/s, blend-out speed for creep branch
+    public float lowSpeedShearDampingC = 1200f; // N*s/m, bristle damping used by modern low-speed branch
+    public float axleSpinDampingK = 250f;        // N*m/(rad/s), contact wheel-axis damping
+    public float axleAirDampingK = 2f;           // N*m/(rad/s), free-spin bearing damping
 
     public float vEps = 0.2f;
 
@@ -47,6 +68,8 @@ public class RubberTireWheelScript : BlockScript
     // 反驱：力/扭矩分离
     // =========================
     public bool decoupleTireForceAndTorque = true;
+    public bool enableDecoupledTireForceApplication = false; // true: linear tire force at COM + spin-axis torque only
+    public bool enableNormalGroundReactionForces = false;     // true: also push dynamic hit rigidbodies with custom normal force
 
     // =========================
     // 踏面裁切（有限宽度）
@@ -60,6 +83,8 @@ public class RubberTireWheelScript : BlockScript
     public bool useRaycastContact = true;
     public float rayExtra = 0.6f;
 
+    public bool enableTreadRayFan = false; // true: cast multiple rays across finite tread width
+    public int treadRayCount = 3;
     // Dev: layer mask performance
     public bool includeLayer0 = false;
 
@@ -103,6 +128,16 @@ public class RubberTireWheelScript : BlockScript
     public bool enableDriveBrake = true;
     public bool invertDriveTorque = false;
     public float maxDriveTorque = 8000f;
+    public bool enableGearbox = true;
+    public float gearCount = 5f;            // rounded to int at runtime
+    public float gearRatio1 = 4.00f;
+    public float gearRatio2 = 2.80f;
+    public float gearRatio3 = 1.90f;
+    public float gearRatio4 = 1.35f;
+    public float gearRatio5 = 1.00f;
+    public float gearRatio6 = 0.75f;
+    public float gearRatio7 = 0.55f;
+    public float gearRatio8 = 0.40f;
 
     // =========================
     // 恒功率约束（Drive torque cap by power）
@@ -119,6 +154,8 @@ public class RubberTireWheelScript : BlockScript
     // =========================
     public bool enableRollingDamping = false;
     public float rollingDampingK = 0.25f;      // extra Rigidbody.angularDrag (1/s)
+    public bool useLoadSensitiveRollingResistance = false; // true: torque around wheel axis, clamped by normal load
+    public float rollingResistanceCoeff = 0.015f;           // tau cap = coeff * Fn * radius
 
     public float maxBrakeTorque = 12000f;
     public float brakeDeadbandOmega = 0.5f;
@@ -159,14 +196,19 @@ public class RubberTireWheelScript : BlockScript
     private MToggle uiRelax, uiDecouple;
     private MSlider uiRelaxL, uiShearK, uiShearC, uiMaxShear;
 
+    private MToggle uiSinglePassLoad, uiCombinedSlip, uiModernLowSpeed, uiStableNormal, uiDecoupledApply, uiNormalGroundReaction;
+    private MSlider uiLongGrip, uiLatGrip, uiLowRelaxFloor, uiLowCreepSpeed, uiLowCreepBlend, uiLowShearDamping, uiAxleSpinDamping, uiAxleAirDamping;
+    private MSlider uiNormalERP, uiNormalVelDamping, uiNormalMassScale, uiNormalSlop;
+
     private MToggle uiDriveBrake;
     private MToggle uiInvertDrive;
-    private MKey uiKeyThrottle, uiKeyBrake, uiKeyReverse;
+    private MKey uiKeyThrottle, uiKeyBrake, uiKeyReverse, uiKeyGearUp, uiKeyGearDown;
     private MSlider uiMaxDriveTorque, uiMaxBrakeTorque, uiBrakeDeadband, uiBrakeHoldK;
-    private MToggle uiPowerLimit;
-    private MSlider uiMaxDrivePower, uiPowerOmegaEps;
-    private MToggle uiRollingDamp;
-    private MSlider uiRollingDampK;
+    private MToggle uiPowerLimit, uiGearbox;
+    private MSlider uiMaxDrivePower, uiPowerOmegaEps, uiGearCount;
+    private MSlider uiGearRatio1, uiGearRatio2, uiGearRatio3, uiGearRatio4, uiGearRatio5, uiGearRatio6, uiGearRatio7, uiGearRatio8;
+    private MToggle uiRollingDamp, uiLoadRollingResistance;
+    private MSlider uiRollingDampK, uiRollingResistanceCoeff;
     private MSlider uiThrottleRise, uiThrottleFall, uiBrakeRise, uiBrakeFall;
 
     private MSlider uiMaxAngVel;
@@ -174,6 +216,8 @@ public class RubberTireWheelScript : BlockScript
     private MToggle uiIncludeLayer0;
 
     private MSlider uiMaxContactPoints;
+    private MToggle uiTreadRayFan;
+    private MSlider uiTreadRayCount;
 
     // NEW UI
     private MToggle uiGateEnable;
@@ -191,6 +235,7 @@ public class RubberTireWheelScript : BlockScript
     // 键盘油门/刹车状态（0~1）
     private float throttle01 = 0f;
     private float brake01 = 0f;
+    private int currentGear = 1;
 
     // Rolling damping via Rigidbody.angularDrag (store original to restore)
     private float baseAngularDrag = 0f;
@@ -198,6 +243,8 @@ public class RubberTireWheelScript : BlockScript
 
     // Temp: count contact samples per attached rigidbody (for per-body weight)
     private readonly Dictionary<int, int> tmpRbSampleCounts = new Dictionary<int, int>(16);
+    private readonly RaycastHit[] raycastHitBuffer = new RaycastHit[128];
+    private readonly List<List<HitSample>> hitListPool = new List<List<HitSample>>(64);
 
     // =========================
     // Debug 可视化（多接触点 + 插值对齐）
@@ -324,12 +371,29 @@ public class RubberTireWheelScript : BlockScript
 
     public override void SafeAwake()
     {
-        uiK = AddSlider("K (Spring)", "k", springK, 0f, 20000f);
-        uiC = AddSlider("C (Damper)", "c", damperC, 0f, 200f);
+        uiK = AddSlider("K (Spring)", "k", springK, 0f, 200000f);
+        uiC = AddSlider("C (Damper)", "c", damperC, 0f, 5000f);
+        uiStableNormal = AddToggle("Stable Normal Support", "nStable", enableStableNormalSupport);
+        uiNormalERP = AddSlider("Normal ERP", "nErp", normalSupportERP, 0f, 1f);
+        uiNormalVelDamping = AddSlider("Normal Vel Damping", "nDamp", normalSupportVelDamping, 0f, 2f);
+        uiNormalMassScale = AddSlider("Normal Mass Scale", "nMass", normalSupportMassScale, 0.25f, 20f);
+        uiNormalSlop = AddSlider("Normal Slop", "nSlop", normalSupportSlop, 0f, 0.05f);
         uiMuS = AddSlider("Mu Static", "muS", muStatic, 0f, 3f);
         uiMuK = AddSlider("Mu Kinetic", "muK", muKinetic, 0f, 3f);
         uiVStatic = AddSlider("vStatic (m/s)", "vStatic", vStatic, 0.01f, 2.0f);
         uiFTau = AddSlider("Force Filter Tau (s)", "fTau", forceFilterTau, 0f, 0.20f);
+
+        uiSinglePassLoad = AddToggle("ADV: Single Load Scale", "advLoad", enableSinglePassLoadScaling);
+        uiCombinedSlip = AddToggle("ADV: Combined Slip", "advSlip", enableCombinedSlipFriction);
+        uiLongGrip = AddSlider("ADV: Long Grip Scale", "muLong", longitudinalGripScale, 0f, 3f);
+        uiLatGrip = AddSlider("ADV: Lat Grip Scale", "muLat", lateralGripScale, 0f, 3f);
+        uiModernLowSpeed = AddToggle("Modern Low Speed Tire", "mls", enableModernLowSpeedTire);
+        uiLowRelaxFloor = AddSlider("LowSpeed Relax Floor", "mlsRf", lowSpeedRelaxSpeedFloor, 0.05f, 5.0f);
+        uiLowCreepSpeed = AddSlider("LowSpeed Creep Speed", "mlsCv", lowSpeedCreepSpeed, 0.01f, 1.0f);
+        uiLowCreepBlend = AddSlider("LowSpeed Creep Blend", "mlsCb", lowSpeedCreepBlend, 0.05f, 3.0f);
+        uiLowShearDamping = AddSlider("LowSpeed Shear Damping", "mlsC", lowSpeedShearDampingC, 0f, 10000f);
+        uiAxleSpinDamping = AddSlider("Axle Spin Damping", "axDmp", axleSpinDampingK, 0f, 5000f);
+        uiAxleAirDamping = AddSlider("Axle Air Damping", "airDmp", axleAirDampingK, 0f, 100f);
 
         uiEnableTire = AddToggle("Tire Model", "tire", enableTireModel);
 
@@ -340,6 +404,8 @@ public class RubberTireWheelScript : BlockScript
         uiMaxShear = AddSlider("Max Shear Disp", "shMax", maxShearDisp, 0.01f, 0.50f);
 
         uiDecouple = AddToggle("Decouple F/T", "decouple", decoupleTireForceAndTorque);
+        uiDecoupledApply = AddToggle("ADV: Decoupled Apply", "advDec", enableDecoupledTireForceApplication);
+        uiNormalGroundReaction = AddToggle("ADV: Normal Reaction", "advNReact", enableNormalGroundReactionForces);
 
         uiDbg = AddToggle("Debug Master", "dbg", debugDraw);
         uiDbgForce = AddToggle("DebugViz: Tire Force", "dbgF", debugVizTireForce);
@@ -347,6 +413,8 @@ public class RubberTireWheelScript : BlockScript
 
         uiTreadClip = AddToggle("Tread Width Clip", "tw-clip", enableTreadWidthClip);
         uiTreadW = AddSlider("Tread Width", "tw", treadWidth, 0.05f, 5f);
+        uiTreadRayFan = AddToggle("ADV: Tread Ray Fan", "advRay", enableTreadRayFan);
+        uiTreadRayCount = AddSlider("ADV: Tread Ray Count", "rayN", treadRayCount, 1f, 7f);
 
         uiLineW = AddSlider("Line Width", "lw", forceLineWidth, 0.01f, 0.30f);
         uiForceScale = AddSlider("Force Scale", "fs", forceToLength, 0.00001f, 0.01f);
@@ -358,13 +426,28 @@ public class RubberTireWheelScript : BlockScript
         uiKeyBrake = AddKey("Brake Key", "kBrk", KeyCode.G);
         uiKeyReverse = AddKey("Reverse Key", "kRev", KeyCode.R);
 
+        uiGearbox = AddToggle("Gearbox", "gbx", enableGearbox);
+        uiKeyGearUp = AddKey("Shift Up Key", "kGUp", KeyCode.PageUp);
+        uiKeyGearDown = AddKey("Shift Down Key", "kGDn", KeyCode.PageDown);
+        uiGearCount = AddSlider("Gear Count", "gCnt", gearCount, 1f, 8f);
+        uiGearRatio1 = AddSlider("Gear 1 Ratio", "gR1", gearRatio1, 0.05f, 10f);
+        uiGearRatio2 = AddSlider("Gear 2 Ratio", "gR2", gearRatio2, 0.05f, 10f);
+        uiGearRatio3 = AddSlider("Gear 3 Ratio", "gR3", gearRatio3, 0.05f, 10f);
+        uiGearRatio4 = AddSlider("Gear 4 Ratio", "gR4", gearRatio4, 0.05f, 10f);
+        uiGearRatio5 = AddSlider("Gear 5 Ratio", "gR5", gearRatio5, 0.05f, 10f);
+        uiGearRatio6 = AddSlider("Gear 6 Ratio", "gR6", gearRatio6, 0.05f, 10f);
+        uiGearRatio7 = AddSlider("Gear 7 Ratio", "gR7", gearRatio7, 0.05f, 10f);
+        uiGearRatio8 = AddSlider("Gear 8 Ratio", "gR8", gearRatio8, 0.05f, 10f);
+
         uiMaxDriveTorque = AddSlider("Max Drive Torque", "drvT", maxDriveTorque, 0f, 50000f);
         uiPowerLimit = AddToggle("Power Limit", "pLim", enablePowerLimit);
         uiMaxDrivePower = AddSlider("Max Drive Power (W)", "pMax", maxDrivePower, 0f, 500000f);
         uiPowerOmegaEps = AddSlider("Power Omega Eps", "pEps", powerLimitOmegaEps, 0.1f, 20f);
 
         uiRollingDamp = AddToggle("Rolling Resistance", "rDmp", enableRollingDamping);
-        uiRollingDampK = AddSlider("Extra Angular Drag", "rK", rollingDampingK, 0f, 5f);
+        uiRollingDampK = AddSlider("Rolling Damping K", "rK", rollingDampingK, 0f, 5000f);
+        uiLoadRollingResistance = AddToggle("ADV: Load Rolling Resist", "advRoll", useLoadSensitiveRollingResistance);
+        uiRollingResistanceCoeff = AddSlider("ADV: Roll Resist Coeff", "rrC", rollingResistanceCoeff, 0f, 0.20f);
 
         uiMaxBrakeTorque = AddSlider("Max Brake Torque", "brkT", maxBrakeTorque, 0f, 80000f);
         uiBrakeDeadband = AddSlider("Brake Deadband (rad/s)", "brkDb", brakeDeadbandOmega, 0f, 10f);
@@ -393,6 +476,7 @@ public class RubberTireWheelScript : BlockScript
     {
         contacts.Clear();
         fixedStepCounter = 0;
+        currentGear = 1;
 
         pointStates.Clear();
         colStates.Clear();
@@ -449,8 +533,8 @@ public class RubberTireWheelScript : BlockScript
         contactRayMask = BuildContactRayMask();
         Rigidbody.maxAngularVelocity = Mathf.Max(10f, maxAngularVelocityLimit);
 
-        // Preferred rolling resistance/damping: use angularDrag (can be toggled and restored).
-        ApplyRollingAngularDrag(contacts.Count > 0);
+        // Legacy rolling damping uses angularDrag. The advanced mode restores angularDrag and applies load-based torque per contact.
+        ApplyRollingAngularDrag(contacts.Count > 0 && !useLoadSensitiveRollingResistance);
 
         // ===== 0) Drive/Brake (remappable keys) =====
         {
@@ -459,6 +543,7 @@ public class RubberTireWheelScript : BlockScript
             bool heldThr = enableDriveBrake && uiKeyThrottle != null && uiKeyThrottle.IsHeld;
             bool heldBrk = enableDriveBrake && uiKeyBrake != null && uiKeyBrake.IsHeld;
             bool heldRev = enableDriveBrake && uiKeyReverse != null && uiKeyReverse.IsHeld;
+            UpdateGearboxInput();
 
             float targetThr = heldThr ? 1f : 0f;
             float targetBrk = heldBrk ? 1f : 0f;
@@ -471,7 +556,9 @@ public class RubberTireWheelScript : BlockScript
             Vector3 aAxis = GetDriveAxisWorld();
             float omegaAxis = Vector3.Dot(Rigidbody.angularVelocity, aAxis);
 
-            float tauDrive = throttle01 * maxDriveTorque;
+            float gearRatio = GetCurrentGearRatio();
+            float engineTorqueAtWheel = maxDriveTorque * gearRatio;
+            float tauDrive = throttle01 * engineTorqueAtWheel;
 
             float flipSign = Flipped ? -1f : 1f;
             float userSign = invertDriveTorque ? -1f : 1f;
@@ -488,7 +575,7 @@ public class RubberTireWheelScript : BlockScript
                 if (absOmega > Mathf.Max(1e-4f, powerLimitOmegaEps))
                 {
                     float tauMaxByPower = maxDrivePower / absOmega;
-                    float tauMax = Mathf.Min(Mathf.Abs(maxDriveTorque), tauMaxByPower);
+                    float tauMax = Mathf.Min(Mathf.Abs(engineTorqueAtWheel), tauMaxByPower);
                     tauDriveCmd = Mathf.Clamp(tauDriveCmd, -tauMax, tauMax);
                 }
             }
@@ -516,6 +603,7 @@ public class RubberTireWheelScript : BlockScript
 
         if (contacts.Count == 0)
         {
+            ApplyAxleSpinStabilization(0f, 0f, GetDriveAxisWorld());
             if (resetShearOnNoContact) pointStates.Clear();
             // gate 状态也要衰减/清理（避免突然恢复时跳变）
             DecayAndCleanupColliderStates();
@@ -635,6 +723,8 @@ public class RubberTireWheelScript : BlockScript
             tmpRbSampleCounts[rbId] = c + 1;
         }
 
+        float totalNormalLoadForAxle = 0f;
+
         for (int i = 0; i < topSamples.Count; i++)
         {
             var s = topSamples[i];
@@ -667,40 +757,55 @@ public class RubberTireWheelScript : BlockScript
             if (rbCount <= 0) rbCount = 1;
             float sampleWeight = 1f / (float)rbCount;
 
+            Rigidbody groundRb = (s.col != null) ? s.col.attachedRigidbody : null;
+            if (groundRb == Rigidbody) groundRb = null;
+
             // ---- Normal force ----
-            float Fn = springK * s.pen;
+            // Legacy spring is explicit; the stable support branch adds a velocity-level ERP impulse so high
+            // apparent support stiffness does not require raising k beyond what a 100 Hz integrator can handle.
+            Vector3 vAtP = Rigidbody.GetPointVelocity(s.p);
+            Vector3 vGroundN = (groundRb != null) ? groundRb.GetPointVelocity(s.p) : Vector3.zero;
+            float vRelN = Vector3.Dot(vAtP - vGroundN, nUse); // positive means separating
+
+            float FnRaw = springK * s.pen;
 
             if (damperC > 0f)
             {
-                Vector3 vAtP = Rigidbody.GetPointVelocity(s.p);
-                float vN = Vector3.Dot(vAtP, nUse);
-                float compressionSpeed = -vN;
-                if (compressionSpeed > 0f) Fn += damperC * compressionSpeed;
+                float compressionSpeed = -vRelN;
+                if (compressionSpeed > 0f) FnRaw += damperC * compressionSpeed;
             }
 
-            Fn = Mathf.Clamp(Fn, 0f, maxNormalForce);
-            Fn *= gate;
-            Fn *= sampleWeight;
+            float FnStable = BuildStableNormalSupportForce(s.pen, vRelN, s.p, nUse, groundRb);
+            if (FnStable > FnRaw) FnRaw = FnStable;
+
+            FnRaw = Mathf.Clamp(FnRaw, 0f, maxNormalForce);
+
+            // Normal load applied to this contact. Legacy tire force below can still apply the old extra gate/weight pass
+            // unless ADV: Single Load Scale is enabled.
+            float Fn = FnRaw * gate * sampleWeight;
             if (Fn <= 1e-6f) continue;
 
             Vector3 FnVec = Fn * nUse;
             Rigidbody.AddForceAtPosition(FnVec, s.p, ForceMode.Force);
+            if (enableNormalGroundReactionForces && groundRb != null)
+                groundRb.AddForceAtPosition(-FnVec, s.p, ForceMode.Force);
+
+            totalNormalLoadForAxle += Fn;
+
+            ApplyLoadSensitiveRollingResistance(Fn, R, aAxisWheel);
 
             // ---- Tire friction per point（可选：enableTireModel）----
             Vector3 Ftire = Vector3.zero;
-            Rigidbody groundRb = null;
 
             if (enableTireModel)
             {
-                groundRb = (s.col != null) ? s.col.attachedRigidbody : null;
-
                 Vector3 vGround = Vector3.zero;
                 if (groundRb != null) vGround = groundRb.GetPointVelocity(s.p);
 
                 Vector3 vWheel = Rigidbody.GetPointVelocity(s.p);
                 Vector3 vRel = vWheel - vGround;
 
-                // 切向基（沿“滚动前进”方向）
+                // 切向基：f=滚动/驱动方向，side=横向方向（合力圆/椭圆只在高级模式使用）
                 Vector3 f = ProjectOnPlane(Vector3.Cross(nUse, aAxisWheel), nUse);
                 if (f.sqrMagnitude < 1e-6f)
                     f = ProjectOnPlane(Vector3.Cross(nUse, transform.right), nUse);
@@ -708,6 +813,19 @@ public class RubberTireWheelScript : BlockScript
                 if (f.sqrMagnitude > 1e-6f)
                 {
                     f.Normalize();
+
+                    Vector3 side = ProjectOnPlane(aAxisWheel, nUse);
+                    if (side.sqrMagnitude < 1e-6f)
+                        side = ProjectOnPlane(Vector3.Cross(f, nUse), nUse);
+                    if (side.sqrMagnitude > 1e-6f)
+                    {
+                        side.Normalize();
+                        if (Vector3.Dot(side, aAxisWheel) < 0f) side = -side;
+                    }
+                    else
+                    {
+                        side = Vector3.zero;
+                    }
 
                     Vector3 vSlip = ProjectOnPlane(vRel, nUse);
                     float vSlipMag = vSlip.magnitude;
@@ -717,10 +835,22 @@ public class RubberTireWheelScript : BlockScript
                         TirePointState st = GetOrCreatePointState(s.col, s.p);
                         st.lastSeenStep = fixedStepCounter;
 
-                        float speed = Mathf.Max(vSlipMag, vEps);
+                        if (enableSinglePassLoadScaling || enableCombinedSlipFriction || enableModernLowSpeedTire)
+                            st.shearDispWorld = ProjectOnPlane(st.shearDispWorld, nUse);
+
+                        float speedFloor = enableModernLowSpeedTire ? Mathf.Max(vEps, lowSpeedRelaxSpeedFloor) : vEps;
+                        float speed = Mathf.Max(vSlipMag, speedFloor);
                         float T = Mathf.Max(1e-4f, relaxLength / speed);
 
-                        Vector3 xDot = vSlip - st.shearDispWorld / T;
+                        // Modern low-speed branch: bristle leak fades out near zero slip, so static deflection can hold.
+                        float leakScale = 1f;
+                        if (enableModernLowSpeedTire)
+                        {
+                            float leakV = Mathf.Max(1e-4f, lowSpeedCreepSpeed);
+                            leakScale = Mathf.Clamp01(vSlipMag / leakV);
+                        }
+
+                        Vector3 xDot = vSlip - st.shearDispWorld * (leakScale / T);
                         st.shearDispWorld += xDot * dtFixed;
 
                         if (maxShearDisp > 1e-5f)
@@ -730,26 +860,65 @@ public class RubberTireWheelScript : BlockScript
                         }
 
                         Vector3 Fraw = -shearK * st.shearDispWorld;
-                        if (shearC > 0f) Fraw += -shearC * xDot;
+                        float shearDamping = shearC;
+                        if (enableModernLowSpeedTire) shearDamping = Mathf.Max(shearDamping, lowSpeedShearDampingC);
+                        if (shearDamping > 0f) Fraw += -shearDamping * xDot;
 
-                        float FmaxS = muStatic * Fn;   // 注意：Fn 已乘 gate
-                        float FmaxK = muKinetic * Fn;  // 注意：Fn 已乘 gate
-                        float Fmag = Fraw.magnitude;
+                        bool staticZone = vSlipMag < Mathf.Max(1e-3f, vStatic);
 
-                        if (vSlipMag < Mathf.Max(1e-3f, vStatic))
+                        if (enableModernLowSpeedTire)
                         {
-                            if (Fmag > FmaxS && Fmag > 1e-6f)
+                            Vector3 Fcreep = BuildLowSpeedCreepForce(vSlip, f, side, Fn);
+                            float blendV = Mathf.Max(1e-4f, lowSpeedCreepBlend);
+                            float creepBlend = 1f - Mathf.Clamp01(vSlipMag / blendV);
+                            creepBlend = creepBlend * creepBlend * (3f - 2f * creepBlend);
+                            Fraw += Fcreep * creepBlend;
+                        }
+
+                        if (enableCombinedSlipFriction && side.sqrMagnitude > 1e-6f)
+                        {
+                            float longScale = Mathf.Max(0f, longitudinalGripScale);
+                            float latScale = Mathf.Max(0f, lateralGripScale);
+                            float scale = 1f;
+
+                            if (staticZone)
                             {
-                                Fraw *= (FmaxK / Fmag);
-                                st.shearDispWorld = -Fraw / Mathf.Max(1e-6f, shearK);
+                                scale = GetCombinedFrictionScale(Fraw, f, side, muStatic * longScale * Fn, muStatic * latScale * Fn);
+                                if (scale < 0.9999f)
+                                    scale = GetCombinedFrictionScale(Fraw, f, side, muKinetic * longScale * Fn, muKinetic * latScale * Fn);
+                            }
+                            else
+                            {
+                                scale = GetCombinedFrictionScale(Fraw, f, side, muKinetic * longScale * Fn, muKinetic * latScale * Fn);
+                            }
+
+                            if (scale < 0.9999f)
+                            {
+                                Fraw *= scale;
+                                st.shearDispWorld *= scale;
                             }
                         }
                         else
                         {
-                            if (Fmag > FmaxK && Fmag > 1e-6f)
+                            float FmaxS = muStatic * Fn;   // 注意：Fn 已乘 gate/sampleWeight
+                            float FmaxK = muKinetic * Fn;  // 注意：Fn 已乘 gate/sampleWeight
+                            float Fmag = Fraw.magnitude;
+
+                            if (staticZone)
                             {
-                                Fraw *= (FmaxK / Fmag);
-                                st.shearDispWorld = -Fraw / Mathf.Max(1e-6f, shearK);
+                                if (Fmag > FmaxS && Fmag > 1e-6f)
+                                {
+                                    Fraw *= (FmaxK / Fmag);
+                                    st.shearDispWorld = -Fraw / Mathf.Max(1e-6f, shearK);
+                                }
+                            }
+                            else
+                            {
+                                if (Fmag > FmaxK && Fmag > 1e-6f)
+                                {
+                                    Fraw *= (FmaxK / Fmag);
+                                    st.shearDispWorld = -Fraw / Mathf.Max(1e-6f, shearK);
+                                }
                             }
                         }
 
@@ -764,24 +933,58 @@ public class RubberTireWheelScript : BlockScript
                             st.FtireFiltered = Fraw;
                             Ftire = Fraw;
                         }
+
+                        if (enableSinglePassLoadScaling)
+                        {
+                            if (enableCombinedSlipFriction && side.sqrMagnitude > 1e-6f)
+                            {
+                                float postMu = staticZone ? muStatic : muKinetic;
+                                Ftire = ClampCombinedTireForce(
+                                    Ftire, f, side,
+                                    postMu * Mathf.Max(0f, longitudinalGripScale) * Fn,
+                                    postMu * Mathf.Max(0f, lateralGripScale) * Fn);
+                            }
+                            else
+                            {
+                                float postMu = staticZone ? muStatic : muKinetic;
+                                Ftire = LimitVectorMagnitude(Ftire, postMu * Fn);
+                            }
+                        }
                     }
                     else
                     {
-                        float FmaxK = muKinetic * Fn; // Fn 已乘 gate
                         if (vSlipMag > 1e-5f)
-                            Ftire = -vSlip / vSlipMag * FmaxK;
+                        {
+                            if (enableCombinedSlipFriction && side.sqrMagnitude > 1e-6f)
+                            {
+                                Ftire = BuildCombinedKineticFriction(
+                                    vSlip, f, side,
+                                    muKinetic * Mathf.Max(0f, longitudinalGripScale) * Fn,
+                                    muKinetic * Mathf.Max(0f, lateralGripScale) * Fn);
+                            }
+                            else
+                            {
+                                float FmaxK = muKinetic * Fn; // Fn 已乘 gate/sampleWeight
+                                Ftire = -vSlip / vSlipMag * FmaxK;
+                            }
+                        }
                         else
+                        {
                             Ftire = Vector3.zero;
+                        }
                     }
 
-                    // gate 同样乘到切向（即使 Fn 已 gate，乘一次不会错，只会更“渐变”）
-                    Ftire *= gate;
-                    Ftire *= sampleWeight;
+                    // Legacy behavior: tire force was gated/weighted once through Fn, then again here.
+                    // ADV: Single Load Scale disables this second pass for physically correct load accounting.
+                    if (!enableSinglePassLoadScaling)
+                    {
+                        Ftire *= gate;
+                        Ftire *= sampleWeight;
+                    }
 
                     if (Ftire.sqrMagnitude > 1e-10f)
                     {
-                        Rigidbody.AddForceAtPosition(Ftire, s.p, ForceMode.Force);
-                        if (groundRb != null) groundRb.AddForceAtPosition(-Ftire, s.p, ForceMode.Force);
+                        ApplyTireForce(Ftire, s.p, groundRb, aAxisWheel);
                     }
                 }
             }
@@ -799,7 +1002,10 @@ public class RubberTireWheelScript : BlockScript
                 dbgLocalContacts[dbgLocalCount] = d;
                 dbgLocalCount++;
             }
+
         }
+
+        ApplyAxleSpinStabilization(totalNormalLoadForAxle, R, aAxisWheel);
 
         // Optional drive torque test hook
         if (Mathf.Abs(driveTorque) > 1e-6f)
@@ -940,9 +1146,135 @@ public class RubberTireWheelScript : BlockScript
         ApplyLineWidthsIfReady();
     }
 
-    
+
+
     // =========================
-    // Rolling damping (preferred): use Rigidbody.angularDrag instead of manual torque
+    // Gearbox
+    // =========================
+    private void UpdateGearboxInput()
+    {
+        int count = GetGearCount();
+        currentGear = ClampGear(currentGear, count);
+
+        if (!enableDriveBrake || !enableGearbox) return;
+
+        if (uiKeyGearUp != null && uiKeyGearUp.IsPressed)
+            currentGear = ClampGear(currentGear + 1, count);
+
+        if (uiKeyGearDown != null && uiKeyGearDown.IsPressed)
+            currentGear = ClampGear(currentGear - 1, count);
+    }
+
+    private int GetGearCount()
+    {
+        int count = Mathf.RoundToInt(gearCount);
+        if (count < 1) return 1;
+        if (count > 8) return 8;
+        return count;
+    }
+
+    private int ClampGear(int gear, int count)
+    {
+        if (count < 1) count = 1;
+        if (gear < 1) return 1;
+        if (gear > count) return count;
+        return gear;
+    }
+
+    private float GetCurrentGearRatio()
+    {
+        if (!enableGearbox) return 1f;
+        int count = GetGearCount();
+        currentGear = ClampGear(currentGear, count);
+        return Mathf.Max(0.05f, GetGearRatio(currentGear));
+    }
+
+    private float GetGearRatio(int gear)
+    {
+        switch (gear)
+        {
+            case 1: return gearRatio1;
+            case 2: return gearRatio2;
+            case 3: return gearRatio3;
+            case 4: return gearRatio4;
+            case 5: return gearRatio5;
+            case 6: return gearRatio6;
+            case 7: return gearRatio7;
+            case 8: return gearRatio8;
+        }
+        return gearRatio1;
+    }
+
+    // =========================
+    // Stable normal support
+    // =========================
+    private float BuildStableNormalSupportForce(float penetration, float relativeNormalVelocity, Vector3 point, Vector3 normal, Rigidbody groundRb)
+    {
+        if (!enableStableNormalSupport) return 0f;
+        if (!HasRigidbody) return 0f;
+        if (normal.sqrMagnitude < 1e-10f) return 0f;
+
+        float dt = Mathf.Max(1e-5f, Time.fixedDeltaTime);
+        float pen = Mathf.Max(0f, penetration - Mathf.Max(0f, normalSupportSlop));
+
+        // Baumgarte/ERP target: correct only a fraction of penetration per fixed step.
+        // This is a velocity target, not a larger explicit k, so it remains stable at 100 Hz.
+        float targetVN = pen * Mathf.Clamp01(normalSupportERP) / dt;
+        float dv = targetVN - relativeNormalVelocity * Mathf.Max(0f, normalSupportVelDamping);
+        if (dv <= 1e-5f) return 0f;
+
+        float effectiveMass = GetEffectiveNormalMass(point, normal, groundRb);
+        effectiveMass *= Mathf.Max(0.01f, normalSupportMassScale);
+
+        return effectiveMass * dv / dt;
+    }
+
+    private float GetEffectiveNormalMass(Vector3 point, Vector3 normal, Rigidbody groundRb)
+    {
+        float invMass = GetPointInverseMassAlongAxis(Rigidbody, point, normal);
+        if (groundRb != null) invMass += GetPointInverseMassAlongAxis(groundRb, point, normal);
+
+        if (invMass > 1e-6f) return 1f / invMass;
+        if (HasRigidbody && Rigidbody.mass > 1e-6f) return Rigidbody.mass;
+        return 1f;
+    }
+
+    private float GetPointInverseMassAlongAxis(Rigidbody rb, Vector3 point, Vector3 axisWorld)
+    {
+        if (rb == null) return 0f;
+        if (rb.isKinematic) return 0f;
+        if (axisWorld.sqrMagnitude < 1e-10f) return 0f;
+
+        axisWorld.Normalize();
+
+        float invMass = 0f;
+        if (rb.mass > 1e-6f) invMass = 1f / rb.mass;
+
+        Vector3 r = point - rb.worldCenterOfMass;
+        Vector3 rn = Vector3.Cross(r, axisWorld);
+        Vector3 invIrn = MultiplyWorldInverseInertia(rb, rn);
+        float angular = Vector3.Dot(Vector3.Cross(invIrn, r), axisWorld);
+        if (angular < 0f) angular = 0f;
+
+        return invMass + angular;
+    }
+
+    private Vector3 MultiplyWorldInverseInertia(Rigidbody rb, Vector3 v)
+    {
+        if (rb == null) return Vector3.zero;
+
+        Quaternion principalToWorld = rb.rotation * rb.inertiaTensorRotation;
+        Vector3 vp = Quaternion.Inverse(principalToWorld) * v;
+        Vector3 I = rb.inertiaTensor;
+
+        vp.x = (I.x > 1e-6f) ? vp.x / I.x : 0f;
+        vp.y = (I.y > 1e-6f) ? vp.y / I.y : 0f;
+        vp.z = (I.z > 1e-6f) ? vp.z / I.z : 0f;
+
+        return principalToWorld * vp;
+    }
+    // =========================
+    // Rolling damping: legacy angularDrag, or ADV load-sensitive wheel-axis torque
     // =========================
     private void ApplyRollingAngularDrag(bool hasContact)
     {
@@ -955,7 +1287,7 @@ public class RubberTireWheelScript : BlockScript
         }
 
         float target = baseAngularDrag;
-        if (enableRollingDamping && rollingDampingK > 0f && hasContact)
+        if (enableRollingDamping && !useLoadSensitiveRollingResistance && rollingDampingK > 0f && hasContact)
             target = baseAngularDrag + rollingDampingK;
 
         // Only set when changed to reduce churn
@@ -963,7 +1295,219 @@ public class RubberTireWheelScript : BlockScript
             Rigidbody.angularDrag = target;
     }
 
-// =========================
+    private void ApplyLoadSensitiveRollingResistance(float normalLoad, float radius, Vector3 wheelAxisWorld)
+    {
+        if (!HasRigidbody) return;
+        if (!enableRollingDamping || !useLoadSensitiveRollingResistance) return;
+        if (normalLoad <= 1e-6f || radius <= 1e-6f || rollingDampingK <= 0f) return;
+
+        if (wheelAxisWorld.sqrMagnitude < 1e-10f) return;
+        wheelAxisWorld.Normalize();
+
+        float omega = Vector3.Dot(Rigidbody.angularVelocity, wheelAxisWorld);
+        if (Mathf.Abs(omega) <= 1e-5f) return;
+
+        float tauViscous = -omega * rollingDampingK;
+        float tauLimit = Mathf.Max(0f, rollingResistanceCoeff) * normalLoad * radius;
+        if (tauLimit > 1e-6f)
+            tauViscous = Mathf.Clamp(tauViscous, -tauLimit, tauLimit);
+
+        if (Mathf.Abs(tauViscous) > 1e-6f)
+            Rigidbody.AddTorque(wheelAxisWorld * tauViscous, ForceMode.Force);
+    }
+
+    private void ApplyTireForce(Vector3 force, Vector3 point, Rigidbody groundRb, Vector3 wheelAxisWorld)
+    {
+        if (force.sqrMagnitude <= 1e-12f) return;
+
+        bool useDecoupled = enableDecoupledTireForceApplication && decoupleTireForceAndTorque;
+        if (useDecoupled)
+        {
+            Rigidbody.AddForce(force, ForceMode.Force);
+
+            if (wheelAxisWorld.sqrMagnitude > 1e-10f)
+            {
+                wheelAxisWorld.Normalize();
+                Vector3 tau = Vector3.Cross(point - Rigidbody.worldCenterOfMass, force);
+                float spinTau = Vector3.Dot(tau, wheelAxisWorld);
+                if (Mathf.Abs(spinTau) > 1e-6f)
+                    Rigidbody.AddTorque(wheelAxisWorld * spinTau, ForceMode.Force);
+            }
+        }
+        else
+        {
+            Rigidbody.AddForceAtPosition(force, point, ForceMode.Force);
+        }
+
+        // Preserve legacy tire reaction behavior: tangential custom tire force always pushes dynamic ground back.
+        if (groundRb != null)
+            groundRb.AddForceAtPosition(-force, point, ForceMode.Force);
+    }
+
+    private Vector3 LimitVectorMagnitude(Vector3 v, float maxMagnitude)
+    {
+        if (maxMagnitude <= 0f) return Vector3.zero;
+        float sqr = v.sqrMagnitude;
+        float maxSqr = maxMagnitude * maxMagnitude;
+        if (sqr <= maxSqr || sqr <= 1e-12f) return v;
+        return v * (maxMagnitude / Mathf.Sqrt(sqr));
+    }
+
+    private float GetCombinedFrictionScale(Vector3 force, Vector3 forward, Vector3 side, float maxLong, float maxSide)
+    {
+        if (force.sqrMagnitude <= 1e-12f) return 1f;
+
+        float fx = Vector3.Dot(force, forward);
+        float fy = Vector3.Dot(force, side);
+        float usage = 0f;
+
+        if (maxLong > 1e-6f) usage += (fx * fx) / (maxLong * maxLong);
+        else if (Mathf.Abs(fx) > 1e-6f) return 0f;
+
+        if (maxSide > 1e-6f) usage += (fy * fy) / (maxSide * maxSide);
+        else if (Mathf.Abs(fy) > 1e-6f) return 0f;
+
+        if (usage <= 1f) return 1f;
+        return 1f / Mathf.Sqrt(usage);
+    }
+
+    private Vector3 ClampCombinedTireForce(Vector3 force, Vector3 forward, Vector3 side, float maxLong, float maxSide)
+    {
+        float fx = Vector3.Dot(force, forward);
+        float fy = Vector3.Dot(force, side);
+        Vector3 tangentForce = forward * fx + side * fy;
+        float scale = GetCombinedFrictionScale(tangentForce, forward, side, maxLong, maxSide);
+        return tangentForce * scale;
+    }
+
+    private Vector3 BuildCombinedKineticFriction(Vector3 vSlip, Vector3 forward, Vector3 side, float maxLong, float maxSide)
+    {
+        Vector3 demand = Vector3.zero;
+
+        float vx = Vector3.Dot(vSlip, forward);
+        if (Mathf.Abs(vx) > 1e-5f && maxLong > 0f)
+            demand += -Mathf.Sign(vx) * maxLong * forward;
+
+        float vy = Vector3.Dot(vSlip, side);
+        if (Mathf.Abs(vy) > 1e-5f && maxSide > 0f)
+            demand += -Mathf.Sign(vy) * maxSide * side;
+
+        return ClampCombinedTireForce(demand, forward, side, maxLong, maxSide);
+    }
+
+    private Vector3 BuildLowSpeedCreepForce(Vector3 vSlip, Vector3 forward, Vector3 side, float normalLoad)
+    {
+        if (!enableModernLowSpeedTire) return Vector3.zero;
+        if (normalLoad <= 1e-6f) return Vector3.zero;
+
+        float creepV = Mathf.Max(1e-4f, lowSpeedCreepSpeed);
+
+        if (enableCombinedSlipFriction && side.sqrMagnitude > 1e-6f)
+        {
+            float maxLong = muStatic * Mathf.Max(0f, longitudinalGripScale) * normalLoad;
+            float maxSide = muStatic * Mathf.Max(0f, lateralGripScale) * normalLoad;
+
+            Vector3 demand = Vector3.zero;
+            float vx = Vector3.Dot(vSlip, forward);
+            if (Mathf.Abs(vx) > 1e-6f && maxLong > 0f)
+                demand += -Mathf.Clamp(vx / creepV, -1f, 1f) * maxLong * forward;
+
+            float vy = Vector3.Dot(vSlip, side);
+            if (Mathf.Abs(vy) > 1e-6f && maxSide > 0f)
+                demand += -Mathf.Clamp(vy / creepV, -1f, 1f) * maxSide * side;
+
+            return ClampCombinedTireForce(demand, forward, side, maxLong, maxSide);
+        }
+
+        float vMag = vSlip.magnitude;
+        if (vMag <= 1e-6f) return Vector3.zero;
+
+        float maxForce = muStatic * normalLoad;
+        float demandMag = maxForce * Mathf.Clamp01(vMag / creepV);
+        return -vSlip / vMag * demandMag;
+    }
+
+    private void ApplyAxleSpinStabilization(float normalLoad, float radius, Vector3 wheelAxisWorld)
+    {
+        if (!enableModernLowSpeedTire) return;
+        if (!HasRigidbody) return;
+        if (wheelAxisWorld.sqrMagnitude < 1e-10f) return;
+
+        wheelAxisWorld.Normalize();
+
+        float omega = Vector3.Dot(Rigidbody.angularVelocity, wheelAxisWorld);
+        if (Mathf.Abs(omega) <= 1e-5f) return;
+
+        bool hasLoad = normalLoad > 1e-6f && radius > 1e-6f;
+        float dampingK = hasLoad ? axleSpinDampingK : axleAirDampingK;
+        if (dampingK <= 0f) return;
+
+        float tau = -omega * dampingK;
+        if (hasLoad)
+        {
+            float tauLimit = Mathf.Max(0f, muStatic) * normalLoad * radius;
+            if (tauLimit > 1e-6f)
+                tau = Mathf.Clamp(tau, -tauLimit, tauLimit);
+        }
+
+        float inertia = GetInertiaAroundWorldAxis(wheelAxisWorld);
+        float dt = Mathf.Max(1e-5f, Time.fixedDeltaTime);
+        if (inertia > 1e-6f)
+        {
+            float stopTorque = Mathf.Abs(omega) * inertia / dt;
+            if (stopTorque > 1e-6f)
+                tau = Mathf.Clamp(tau, -stopTorque, stopTorque);
+        }
+
+        if (Mathf.Abs(tau) > 1e-6f)
+            Rigidbody.AddTorque(wheelAxisWorld * tau, ForceMode.Force);
+    }
+
+    private float GetInertiaAroundWorldAxis(Vector3 axisWorld)
+    {
+        if (!HasRigidbody) return 0f;
+        if (axisWorld.sqrMagnitude < 1e-10f) return 0f;
+        axisWorld.Normalize();
+
+        Quaternion principalToWorld = Rigidbody.rotation * Rigidbody.inertiaTensorRotation;
+        Vector3 axisPrincipal = Quaternion.Inverse(principalToWorld) * axisWorld;
+        if (axisPrincipal.sqrMagnitude > 1e-10f) axisPrincipal.Normalize();
+
+        Vector3 I = Rigidbody.inertiaTensor;
+        float ix = Mathf.Max(0f, I.x);
+        float iy = Mathf.Max(0f, I.y);
+        float iz = Mathf.Max(0f, I.z);
+
+        return ix * axisPrincipal.x * axisPrincipal.x
+             + iy * axisPrincipal.y * axisPrincipal.y
+             + iz * axisPrincipal.z * axisPrincipal.z;
+    }
+
+    private void RecycleHitLists()
+    {
+        foreach (var kv in hitsByCol)
+        {
+            List<HitSample> list = kv.Value;
+            if (list == null) continue;
+            list.Clear();
+            hitListPool.Add(list);
+        }
+        hitsByCol.Clear();
+    }
+
+    private List<HitSample> GetHitListFromPool()
+    {
+        int last = hitListPool.Count - 1;
+        if (last >= 0)
+        {
+            List<HitSample> list = hitListPool[last];
+            hitListPool.RemoveAt(last);
+            return list;
+        }
+        return new List<HitSample>(8);
+    }
+
+    // =========================
     // Contact gather (per collider aggregation)
     // =========================
     private void GatherTopContactSamples(
@@ -972,59 +1516,79 @@ public class RubberTireWheelScript : BlockScript
         int N, List<ContactSample> outTop)
     {
         outTop.Clear();
-        hitsByCol.Clear();
+        RecycleHitLists();
 
         if (!useRaycastContact) return;
 
         float maxDist = R + Mathf.Max(0f, rayExtra);
 
-        RaycastHit[] hits = Physics.RaycastAll(
-            center,
-            downDir,
-            maxDist,
-            contactRayMask,
-            QueryTriggerInteraction.Ignore
-        );
-
-        if (hits == null || hits.Length == 0) return;
-
-        // collect hits and group by collider
-        for (int i = 0; i < hits.Length; i++)
+        int rayCount = 1;
+        bool useRayFan = enableTreadRayFan && doClip && halfWWorld > 1e-4f && axisWorldUnit.sqrMagnitude > 1e-8f;
+        if (useRayFan)
         {
-            Collider c = hits[i].collider;
-            if (c == null) continue;
+            axisWorldUnit.Normalize();
+            rayCount = Mathf.Clamp(treadRayCount, 1, 7);
+            if (rayCount > 1 && (rayCount % 2) == 0) rayCount = Mathf.Min(7, rayCount + 1);
+        }
 
-            if (!contacts.Contains(c)) continue;
-            if (!IsColliderInContactLayers(c)) continue;
+        for (int r = 0; r < rayCount; r++)
+        {
+            float u = 0f;
+            if (rayCount > 1) u = -1f + (2f * (float)r) / (float)(rayCount - 1);
 
-            Vector3 p = hits[i].point;
-            Vector3 n = hits[i].normal;
-            if (n.sqrMagnitude < 1e-12f) continue;
-            n.Normalize();
+            Vector3 rayOrigin = useRayFan ? center + axisWorldUnit * (u * halfWWorld) : center;
+            int hitCount = Physics.RaycastNonAlloc(
+                rayOrigin,
+                downDir,
+                raycastHitBuffer,
+                maxDist,
+                contactRayMask,
+                QueryTriggerInteraction.Ignore
+            );
 
-            if (doClip && !IsWithinTreadWidth(p, center, axisWorldUnit, halfWWorld))
-                continue;
+            if (hitCount <= 0) continue;
+            if (hitCount > raycastHitBuffer.Length) hitCount = raycastHitBuffer.Length;
 
-            float dist = Vector3.Distance(center, p);
-            float pen = R - dist;
-            if (pen <= minPenForContact) continue;
-
-            int id = c.GetInstanceID();
-
-            HitSample hs;
-            hs.col = c;
-            hs.colId = id;
-            hs.p = p;
-            hs.n = n;
-            hs.pen = pen;
-
-            List<HitSample> list;
-            if (!hitsByCol.TryGetValue(id, out list))
+            // collect hits and group by collider
+            for (int i = 0; i < hitCount; i++)
             {
-                list = new List<HitSample>(8);
-                hitsByCol.Add(id, list);
+                RaycastHit hit = raycastHitBuffer[i];
+                Collider c = hit.collider;
+                if (c == null) continue;
+
+                if (!contacts.Contains(c)) continue;
+                if (!IsColliderInContactLayers(c)) continue;
+
+                Vector3 p = hit.point;
+                Vector3 n = hit.normal;
+                if (n.sqrMagnitude < 1e-12f) continue;
+                n.Normalize();
+
+                if (doClip && !IsWithinTreadWidth(p, center, axisWorldUnit, halfWWorld))
+                    continue;
+
+                float dist = hit.distance;
+                if (dist <= 1e-6f) dist = Vector3.Distance(rayOrigin, p);
+                float pen = R - dist;
+                if (pen <= minPenForContact) continue;
+
+                int id = c.GetInstanceID();
+
+                HitSample hs;
+                hs.col = c;
+                hs.colId = id;
+                hs.p = p;
+                hs.n = n;
+                hs.pen = pen;
+
+                List<HitSample> list;
+                if (!hitsByCol.TryGetValue(id, out list))
+                {
+                    list = GetHitListFromPool();
+                    hitsByCol.Add(id, list);
+                }
+                list.Add(hs);
             }
-            list.Add(hs);
         }
 
         if (hitsByCol.Count == 0) return;
@@ -1042,6 +1606,7 @@ public class RubberTireWheelScript : BlockScript
             float wsum = 0f;
             Vector3 pAcc = Vector3.zero;
             Vector3 nAcc = Vector3.zero;
+            float penAcc = 0f;
 
             float penMax = list[0].pen;
 
@@ -1051,6 +1616,7 @@ public class RubberTireWheelScript : BlockScript
                 wsum += w;
                 pAcc += list[i].p * w;
                 nAcc += list[i].n * w;
+                penAcc += list[i].pen * w;
             }
 
             if (wsum <= 1e-8f)
@@ -1062,7 +1628,12 @@ public class RubberTireWheelScript : BlockScript
             else nAgg = list[0].n;
 
             float distAgg = Vector3.Distance(center, pAgg);
-            float penAgg = R - distAgg;
+            float penAgg;
+            if (useRayFan && rayCount > 1)
+                penAgg = penAcc / wsum;
+            else
+                penAgg = R - distAgg;
+
             penAgg = Mathf.Clamp(penAgg, 0f, penMax);
 
             if (penAgg <= minPenForContact) continue;
@@ -1073,7 +1644,7 @@ public class RubberTireWheelScript : BlockScript
             agg.p = pAgg;
             agg.n = nAgg;
             agg.pen = penAgg;
-            agg.dist = distAgg;
+            agg.dist = R - penAgg;
 
             outTop.Add(agg);
         }
@@ -1244,10 +1815,27 @@ public class RubberTireWheelScript : BlockScript
     {
         if (uiK != null) springK = uiK.Value;
         if (uiC != null) damperC = uiC.Value;
+        if (uiStableNormal != null) enableStableNormalSupport = uiStableNormal.IsActive;
+        if (uiNormalERP != null) normalSupportERP = uiNormalERP.Value;
+        if (uiNormalVelDamping != null) normalSupportVelDamping = uiNormalVelDamping.Value;
+        if (uiNormalMassScale != null) normalSupportMassScale = uiNormalMassScale.Value;
+        if (uiNormalSlop != null) normalSupportSlop = uiNormalSlop.Value;
         if (uiMuS != null) muStatic = uiMuS.Value;
         if (uiMuK != null) muKinetic = uiMuK.Value;
         if (uiVStatic != null) vStatic = uiVStatic.Value;
         if (uiFTau != null) forceFilterTau = uiFTau.Value;
+
+        if (uiSinglePassLoad != null) enableSinglePassLoadScaling = uiSinglePassLoad.IsActive;
+        if (uiCombinedSlip != null) enableCombinedSlipFriction = uiCombinedSlip.IsActive;
+        if (uiLongGrip != null) longitudinalGripScale = uiLongGrip.Value;
+        if (uiLatGrip != null) lateralGripScale = uiLatGrip.Value;
+        if (uiModernLowSpeed != null) enableModernLowSpeedTire = uiModernLowSpeed.IsActive;
+        if (uiLowRelaxFloor != null) lowSpeedRelaxSpeedFloor = uiLowRelaxFloor.Value;
+        if (uiLowCreepSpeed != null) lowSpeedCreepSpeed = uiLowCreepSpeed.Value;
+        if (uiLowCreepBlend != null) lowSpeedCreepBlend = uiLowCreepBlend.Value;
+        if (uiLowShearDamping != null) lowSpeedShearDampingC = uiLowShearDamping.Value;
+        if (uiAxleSpinDamping != null) axleSpinDampingK = uiAxleSpinDamping.Value;
+        if (uiAxleAirDamping != null) axleAirDampingK = uiAxleAirDamping.Value;
 
         if (uiEnableTire != null) enableTireModel = uiEnableTire.IsActive;
 
@@ -1258,6 +1846,8 @@ public class RubberTireWheelScript : BlockScript
         if (uiMaxShear != null) maxShearDisp = uiMaxShear.Value;
 
         if (uiDecouple != null) decoupleTireForceAndTorque = uiDecouple.IsActive;
+        if (uiDecoupledApply != null) enableDecoupledTireForceApplication = uiDecoupledApply.IsActive;
+        if (uiNormalGroundReaction != null) enableNormalGroundReactionForces = uiNormalGroundReaction.IsActive;
 
         if (uiDbg != null) debugDraw = uiDbg.IsActive;
         if (uiDbgForce != null) debugVizTireForce = uiDbgForce.IsActive;
@@ -1265,6 +1855,8 @@ public class RubberTireWheelScript : BlockScript
 
         if (uiTreadClip != null) enableTreadWidthClip = uiTreadClip.IsActive;
         if (uiTreadW != null) treadWidth = uiTreadW.Value;
+        if (uiTreadRayFan != null) enableTreadRayFan = uiTreadRayFan.IsActive;
+        if (uiTreadRayCount != null) treadRayCount = Mathf.RoundToInt(uiTreadRayCount.Value);
 
         if (uiLineW != null)
         {
@@ -1278,12 +1870,25 @@ public class RubberTireWheelScript : BlockScript
         if (uiDriveBrake != null) enableDriveBrake = uiDriveBrake.IsActive;
         if (uiInvertDrive != null) invertDriveTorque = uiInvertDrive.IsActive;
         if (uiMaxDriveTorque != null) maxDriveTorque = uiMaxDriveTorque.Value;
+        if (uiGearbox != null) enableGearbox = uiGearbox.IsActive;
+        if (uiGearCount != null) gearCount = Mathf.Clamp(Mathf.Round(uiGearCount.Value), 1f, 8f);
+        if (uiGearRatio1 != null) gearRatio1 = uiGearRatio1.Value;
+        if (uiGearRatio2 != null) gearRatio2 = uiGearRatio2.Value;
+        if (uiGearRatio3 != null) gearRatio3 = uiGearRatio3.Value;
+        if (uiGearRatio4 != null) gearRatio4 = uiGearRatio4.Value;
+        if (uiGearRatio5 != null) gearRatio5 = uiGearRatio5.Value;
+        if (uiGearRatio6 != null) gearRatio6 = uiGearRatio6.Value;
+        if (uiGearRatio7 != null) gearRatio7 = uiGearRatio7.Value;
+        if (uiGearRatio8 != null) gearRatio8 = uiGearRatio8.Value;
+        currentGear = ClampGear(currentGear, GetGearCount());
         if (uiPowerLimit != null) enablePowerLimit = uiPowerLimit.IsActive;
         if (uiMaxDrivePower != null) maxDrivePower = uiMaxDrivePower.Value;
         if (uiPowerOmegaEps != null) powerLimitOmegaEps = uiPowerOmegaEps.Value;
 
         if (uiRollingDamp != null) enableRollingDamping = uiRollingDamp.IsActive;
         if (uiRollingDampK != null) rollingDampingK = uiRollingDampK.Value;
+        if (uiLoadRollingResistance != null) useLoadSensitiveRollingResistance = uiLoadRollingResistance.IsActive;
+        if (uiRollingResistanceCoeff != null) rollingResistanceCoeff = uiRollingResistanceCoeff.Value;
         if (uiMaxBrakeTorque != null) maxBrakeTorque = uiMaxBrakeTorque.Value;
         if (uiBrakeDeadband != null) brakeDeadbandOmega = uiBrakeDeadband.Value;
         if (uiBrakeHoldK != null) brakeHoldK = uiBrakeHoldK.Value;
