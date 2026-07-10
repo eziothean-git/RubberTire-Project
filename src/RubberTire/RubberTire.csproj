@@ -48,6 +48,9 @@
   <ItemGroup>
     <Compile Include="Mod.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="RubberTireWheelScript.Drivetrain.cs" />
+    <Compile Include="RubberTireWheelScript.Lateral.cs" />
+    <Compile Include="RubberTireWheelScript.Support.cs" />
     <Compile Include="RubberTireScript.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
