@@ -65,10 +65,10 @@ public partial class RubberTireWheelScript : BlockScript
     // =========================
     // 角速度上限
     // =========================
-    // A5: solver-stability policy. Above ~0.5 rad of rotation per fixed step the
-    // block joint cannot hold axle alignment and precession diverges ("wobble").
-    // Hard cap, drive torque gating and wobble damping all share this bound.
-    internal const float SpinHardCap = 60f;
+    // Axial wheel spin may legitimately exceed the old 60 rad/s ceiling on
+    // large high-speed tyres. Perpendicular wobble is handled separately, so
+    // the user-facing spin ceiling does not need to delay that stabilizer.
+    internal const float SpinHardCap = 150f;
     public float maxAngularVelocityLimit = SpinHardCap;
 
     // =========================

@@ -211,7 +211,7 @@ public partial class RubberTireWheelScript
         s.Add(FactoryFloat("Contact", "gOut", "Gate fade-out frames", 1f, 20f, delegate { return gateFadeOutFrames; }, delegate(float v) { gateFadeOutFrames = Mathf.RoundToInt(v); }).In("Filtering").Adv().When(whenContactGate));
         s.Add(FactoryBool("Contact", "nF", "Normal filter", delegate { return enableNormalFilter; }, delegate(bool v) { enableNormalFilter = v; }).In("Filtering").Adv());
         s.Add(FactoryFloat("Contact", "nFa", "Normal filter alpha", 0.01f, 1f, delegate { return normalFilterAlpha; }, delegate(float v) { normalFilterAlpha = v; }).In("Filtering").Adv().When(whenNormalFilter));
-        s.Add(FactoryFloat("Contact", "maxW", "Maximum angular velocity", 10f, SpinHardCap, delegate { return maxAngularVelocityLimit; }, delegate(float v) { maxAngularVelocityLimit = v; }).In("Limits").Tip("Hard capped at 60 rad/s for joint solver stability"));
+        s.Add(FactoryFloat("Contact", "maxW", "Maximum angular velocity", 10f, SpinHardCap, delegate { return maxAngularVelocityLimit; }, delegate(float v) { maxAngularVelocityLimit = v; }).In("Limits").Tip("Axial wheel-spin ceiling up to 150 rad/s; perpendicular wobble damping still engages from 30 rad/s"));
 
         // ===== Visual =====
         s.Add(FactoryBool("Visual", "dbg", "Debug drawing", delegate { return debugDraw; }, delegate(bool v) { debugDraw = v; }).In("Debug"));

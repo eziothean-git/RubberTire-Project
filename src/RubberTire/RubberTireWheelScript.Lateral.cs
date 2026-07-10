@@ -998,6 +998,8 @@ public partial class RubberTireWheelScript
     // normal speeds. One-sided on purpose: this is an energy sink, and reacting
     // the impulse on the parent would feed the wobble back into the chassis.
     private const float WobbleDampingFraction = 0.25f;
+    private const float WobbleDampingStartSpeed = 30f;
+    private const float WobbleDampingFullSpeed = 60f;
 
     private void ApplyAxleWobbleDamping(Vector3 wheelAxisWorld)
     {
@@ -1009,11 +1011,9 @@ public partial class RubberTireWheelScript
         Rigidbody parentBody = GetJointParentBody();
         if (parentBody != null) omegaRel -= parentBody.angularVelocity;
 
-        float spinCap = GetSpinCap();
-        float engageStart = 0.5f * spinCap;
         float engage = Mathf.Clamp01(
-            (omegaRel.magnitude - engageStart)
-            / Mathf.Max(1e-4f, spinCap - engageStart));
+            (omegaRel.magnitude - WobbleDampingStartSpeed)
+            / (WobbleDampingFullSpeed - WobbleDampingStartSpeed));
         if (engage <= 1e-4f) return;
 
         Vector3 omegaPerp = omegaRel
