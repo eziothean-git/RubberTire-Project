@@ -100,7 +100,19 @@ public partial class RubberTireWheelScript : BlockScript
     // A5: immediate joint parent (steering knuckle, suspension arm, chassis...).
     private Rigidbody jointParentBody;
     private bool jointParentCached;
+    private Transform ownSimulationRoot;
+    private readonly HashSet<Collider> ownMachineColliders = new HashSet<Collider>();
+    private int lastOwnMachineHitCount;
     private bool lastGatherWasMultiRay;
+
+    // Physics queries must use the Rigidbody pose. With interpolation enabled,
+    // reading a child Transform can return a render pose between fixed steps;
+    // using that point with AddForceAtPosition produces a rotating lever-arm bias.
+    private bool treadPhysicsGeometryCached;
+    private Vector3 treadCenterBodyLocal;
+    private Vector3 treadAxisBodyLocal = Vector3.up;
+    private float treadRadiusWorld = 1f;
+    private float treadAxisScaleWorld = 1f;
 
     // Temp: count contact samples per attached rigidbody (for per-body weight)
     private readonly Dictionary<int, int> tmpRbSampleCounts = new Dictionary<int, int>(16);
@@ -134,9 +146,10 @@ public partial class RubberTireWheelScript : BlockScript
     private struct DebugContactLocalData
     {
         public bool active;
-        public Vector3 pLocal;
-        // 方向量保留为 world（不要用插值后的 Rigidbody.rotation 去还原方向），
-        // 否则轮子自转时 rotation 插值包含 spin，会把“本应指向世界向上/沿地面”的向量也一起转走。
+        // Contact samples and forces are world-space physics data. Keeping the
+        // point world-space is just as important as keeping the directions there:
+        // a tyre-local point would rotate around the axle during interpolation.
+        public Vector3 pWorld;
         public Vector3 nWorld;
         public float FnMag;
         public Vector3 FtWorld;
@@ -147,9 +160,10 @@ public partial class RubberTireWheelScript : BlockScript
     private int dbgLocalCount = 0;
     private bool dbgHasLocal = false;
 
-    // 本帧（物理）采样到的轮心/踏面裁切信息（全部用 Rigidbody local space 存）
-    private Vector3 dbgCenterLocal = Vector3.zero;
-    private Vector3 dbgAxisLocal = Vector3.right;
+    // Fixed-step world-space debug snapshot. It intentionally does not follow
+    // the wheel's render interpolation or spin after the force was submitted.
+    private Vector3 dbgCenterWorld = Vector3.zero;
+    private Vector3 dbgAxisWorld = Vector3.right;
     private float dbgHalfWWorld = 0f;
     private float dbgRadiusWorld = 1f;
     private bool dbgDoClip = false;
@@ -230,6 +244,8 @@ public partial class RubberTireWheelScript : BlockScript
         baseAngularDragCaptured = true;
 
         treadTriggerCapsule = FindTreadTriggerCapsule();
+        CacheTreadPhysicsGeometry();
+        CacheOwnMachineColliders();
 
         contactRayMask = BuildContactRayMask();
 
@@ -250,6 +266,9 @@ public partial class RubberTireWheelScript : BlockScript
 
         DestroyDebugObjects();
         treadTriggerCapsule = null;
+        treadPhysicsGeometryCached = false;
+        ownSimulationRoot = null;
+        ownMachineColliders.Clear();
 
         // Restore baseline angular drag if we modified it.
         if (HasRigidbody && baseAngularDragCaptured)
@@ -308,15 +327,14 @@ public partial class RubberTireWheelScript : BlockScript
         // ===== 轮心/半径（世界）=====
         Vector3 center;
         float R;
-        if (treadTriggerCapsule != null)
+        if (treadPhysicsGeometryCached)
         {
-            center = treadTriggerCapsule.transform.TransformPoint(treadTriggerCapsule.center);
-            float s = MaxAbsComponent(treadTriggerCapsule.transform.lossyScale);
-            R = treadTriggerCapsule.radius * s;
+            center = Rigidbody.position + Rigidbody.rotation * treadCenterBodyLocal;
+            R = treadRadiusWorld;
         }
         else
         {
-            center = transform.position;
+            center = Rigidbody.position;
             R = 1.0f;
         }
 
@@ -336,7 +354,13 @@ public partial class RubberTireWheelScript : BlockScript
 
         if (doClip)
         {
-            if (treadTriggerCapsule != null)
+            if (treadPhysicsGeometryCached)
+            {
+                axisWorld = Rigidbody.rotation * treadAxisBodyLocal;
+                axisWorld.Normalize();
+                halfW = 0.5f * treadWidth * treadAxisScaleWorld;
+            }
+            else if (treadTriggerCapsule != null)
             {
                 Transform t = treadTriggerCapsule.transform;
                 switch (treadTriggerCapsule.direction)
@@ -386,20 +410,16 @@ public partial class RubberTireWheelScript : BlockScript
         // ===== 3) Apply forces per point =====
         float dtFixed = Time.fixedDeltaTime;
 
-        // Debug：在 FixedUpdate 里采样“要画什么”，并用 Rigidbody local space 存下来。
-        // LateUpdate 用插值后的 Pose 还原到世界坐标画出来。
+        // Debug: snapshot the exact world point used by AddForceAtPosition.
+        // Re-applying the interpolated wheel rotation would move a stationary
+        // ground contact around the axle and make the force look mis-injected.
         bool doDbgSample = ShowDebugVisuals && debugDraw && (fixedStepCounter % Mathf.Max(1, drawEveryFixedSteps) == 0);
-        Quaternion rbInvRot = Quaternion.identity;
-        Vector3 rbPos = Vector3.zero;
         if (doDbgSample)
         {
-            rbPos = Rigidbody.position;
-            rbInvRot = Quaternion.Inverse(Rigidbody.rotation);
-
             EnsureDebugLocalCapacity(topSamples.Count);
             dbgLocalCount = 0;
-            dbgCenterLocal = rbInvRot * (center - rbPos);
-            dbgAxisLocal = rbInvRot * axisWorld;
+            dbgCenterWorld = center;
+            dbgAxisWorld = axisWorld;
             dbgHalfWWorld = halfW;
             dbgRadiusWorld = R;
             dbgDoClip = doClip;
@@ -474,7 +494,7 @@ public partial class RubberTireWheelScript : BlockScript
             {
                 DebugContactLocalData d;
                 d.active = true;
-                d.pLocal = rbInvRot * (s.p - rbPos);
+                d.pWorld = s.p;
                 d.nWorld = nUse;
                 d.FnMag = Fn;
                 d.FtWorld = Vector3.zero;
@@ -503,7 +523,8 @@ public partial class RubberTireWheelScript : BlockScript
 
     public override void SimulateLateUpdateAlways()
     {
-        // 只负责渲染：用当前 Rigidbody 的插值 Pose，把 FixedUpdate 缓存的 local 数据还原到世界坐标
+        // Render the fixed-step world-space force snapshot. Contact points belong
+        // to the contacted surface, not to the tyre's spinning local frame.
         if (!IsSimulating || !HasRigidbody)
         {
             dbgHasLocal = false;
@@ -528,11 +549,8 @@ public partial class RubberTireWheelScript : BlockScript
         EnsureDebugPointPool(Mathf.Max(dbgLocalCount, Mathf.Clamp(maxContactPoints, 1, 12)));
         ShowDebugObjects();
 
-        Vector3 rbPos = Rigidbody.position;
-        Quaternion rbRot = Rigidbody.rotation;
-
-        Vector3 center = rbPos + rbRot * dbgCenterLocal;
-        Vector3 axisWorld = rbRot * dbgAxisLocal;
+        Vector3 center = dbgCenterWorld;
+        Vector3 axisWorld = dbgAxisWorld;
         if (axisWorld.sqrMagnitude > 1e-12f) axisWorld.Normalize();
         else axisWorld = GetWheelAxisWorld();
 
@@ -549,7 +567,7 @@ public partial class RubberTireWheelScript : BlockScript
 
             DebugContactLocalData d = dbgLocalContacts[i];
 
-            Vector3 p = rbPos + rbRot * d.pLocal;
+            Vector3 p = d.pWorld;
             Vector3 n = d.nWorld;
             if (n.sqrMagnitude > 1e-12f) n.Normalize();
             else n = Vector3.up;
@@ -658,6 +676,7 @@ public partial class RubberTireWheelScript : BlockScript
     {
         outTop.Clear();
         RecycleHitLists();
+        lastOwnMachineHitCount = 0;
 
         if (!useRaycastContact) return;
 
@@ -732,8 +751,11 @@ public partial class RubberTireWheelScript : BlockScript
                     Collider c = hit.collider;
                     if (c == null) continue;
 
-                    if (c.attachedRigidbody == Rigidbody) continue;
-                    if (parentRb != null && c.attachedRigidbody == parentRb) continue;
+                    if (IsOwnMachineCollider(c, parentRb))
+                    {
+                        lastOwnMachineHitCount++;
+                        continue;
+                    }
 
                     Vector3 p = hit.point;
                     Vector3 n = hit.normal;
@@ -1020,6 +1042,11 @@ public partial class RubberTireWheelScript : BlockScript
     // =========================
     private int BuildContactRayMask()
     {
+        // Historical versions queried only Besiege ground layers 24/29 and
+        // optionally layer 0. That was also used as an accidental self-filter,
+        // but it missed valid surfaces on layer pairs disabled for trigger
+        // callbacks. Raycasts do not use the trigger collision-pair matrix, so
+        // keep all layers queryable and filter this machine by identity instead.
         return ~0;
     }
 
@@ -1029,6 +1056,12 @@ public partial class RubberTireWheelScript : BlockScript
     // =========================
     private Vector3 GetWheelAxisWorld()
     {
+        if (treadPhysicsGeometryCached && HasRigidbody)
+        {
+            Vector3 axisWorld = Rigidbody.rotation * treadAxisBodyLocal;
+            if (axisWorld.sqrMagnitude > 1e-10f) return axisWorld.normalized;
+        }
+
         if (treadTriggerCapsule != null)
         {
             Transform t = treadTriggerCapsule.transform;
@@ -1049,6 +1082,63 @@ public partial class RubberTireWheelScript : BlockScript
             case AxisLocal.Z: return transform.forward;
         }
         return transform.up;
+    }
+
+    private bool IsOwnMachineCollider(Collider candidate, Rigidbody directParent)
+    {
+        if (candidate == null) return true;
+
+        Rigidbody candidateBody = candidate.attachedRigidbody;
+        if (candidateBody == Rigidbody) return true;
+        if (directParent != null && candidateBody == directParent) return true;
+        if (ownMachineColliders.Contains(candidate)) return true;
+
+        // Eight-direction contact rays can see suspension, bodywork and other
+        // blocks that the legacy downward ray never crossed. Treating those as
+        // ground creates equal-and-opposite forces inside one machine: the VIZ
+        // arrows look valid, but the machine receives no net support or grip.
+        Transform machineRoot = ownSimulationRoot;
+        Transform candidateTransform = candidate.transform;
+        return machineRoot != null
+            && candidateTransform != null
+            && (candidateTransform == machineRoot
+                || candidateTransform.IsChildOf(machineRoot));
+    }
+
+    private void CacheOwnMachineColliders()
+    {
+        ownMachineColliders.Clear();
+        ownSimulationRoot = Machine != null ? Machine.SimulationMachine : null;
+
+        // Prefer the public modding API's simulation block list. It remains
+        // accurate when Besiege reparents individual rigidbody clusters and a
+        // simple IsChildOf(machineRoot) test would no longer be sufficient.
+        if (Machine != null && Machine.SimulationBlocks != null)
+        {
+            for (int i = 0; i < Machine.SimulationBlocks.Count; i++)
+            {
+                Modding.Blocks.Block block = Machine.SimulationBlocks[i];
+                if (block == null || block.GameObject == null) continue;
+                Collider[] blockColliders = block.GameObject.GetComponentsInChildren<Collider>(true);
+                for (int c = 0; c < blockColliders.Length; c++)
+                {
+                    if (blockColliders[c] != null)
+                        ownMachineColliders.Add(blockColliders[c]);
+                }
+            }
+        }
+
+        // Fallback for loader variants that have not populated SimulationBlocks
+        // when OnSimulateStart runs.
+        if (ownSimulationRoot != null)
+        {
+            Collider[] rootedColliders = ownSimulationRoot.GetComponentsInChildren<Collider>(true);
+            for (int i = 0; i < rootedColliders.Length; i++)
+            {
+                if (rootedColliders[i] != null)
+                    ownMachineColliders.Add(rootedColliders[i]);
+            }
+        }
     }
 
     private Vector3 GetDriveAxisWorld()
@@ -1155,6 +1245,36 @@ public partial class RubberTireWheelScript : BlockScript
             return cc;
         }
         return null;
+    }
+
+    private void CacheTreadPhysicsGeometry()
+    {
+        treadPhysicsGeometryCached = false;
+        if (!HasRigidbody || treadTriggerCapsule == null) return;
+
+        Transform triggerTransform = treadTriggerCapsule.transform;
+        Vector3 centerWorld = triggerTransform.TransformPoint(treadTriggerCapsule.center);
+        Vector3 axisWorld;
+        switch (treadTriggerCapsule.direction)
+        {
+            case 0: axisWorld = triggerTransform.right; break;
+            case 1: axisWorld = triggerTransform.up; break;
+            default: axisWorld = triggerTransform.forward; break;
+        }
+        if (axisWorld.sqrMagnitude < 1e-10f) return;
+
+        Quaternion bodyInverse = Quaternion.Inverse(Rigidbody.rotation);
+        treadCenterBodyLocal = bodyInverse * (centerWorld - Rigidbody.position);
+        treadAxisBodyLocal = (bodyInverse * axisWorld).normalized;
+        Vector3 triggerScale = triggerTransform.lossyScale;
+        treadRadiusWorld = treadTriggerCapsule.radius * MaxAbsComponent(triggerScale);
+        switch (treadTriggerCapsule.direction)
+        {
+            case 0: treadAxisScaleWorld = Mathf.Abs(triggerScale.x); break;
+            case 1: treadAxisScaleWorld = Mathf.Abs(triggerScale.y); break;
+            default: treadAxisScaleWorld = Mathf.Abs(triggerScale.z); break;
+        }
+        treadPhysicsGeometryCached = treadRadiusWorld > 1e-5f;
     }
 
     private float MaxAbsComponent(Vector3 v)

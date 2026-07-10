@@ -850,7 +850,8 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         if (contactLive != null && activeTab == "Contact")
         {
             int count = target.FactoryContactSampleCount();
-            string text = "live samples: " + count;
+            string text = "live samples: " + count
+                + "   self hits filtered: " + target.FactoryFilteredOwnMachineHits();
             for (int i = 0; i < count; i++)
             {
                 float pen, gate;

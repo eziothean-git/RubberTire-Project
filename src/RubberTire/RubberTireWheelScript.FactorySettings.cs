@@ -394,6 +394,11 @@ public partial class RubberTireWheelScript
         return IsSimulating ? topSamples.Count : 0;
     }
 
+    internal int FactoryFilteredOwnMachineHits()
+    {
+        return IsSimulating ? lastOwnMachineHitCount : 0;
+    }
+
     internal void FactoryContactSample(int index, out float penetration, out float gate)
     {
         penetration = 0f;
