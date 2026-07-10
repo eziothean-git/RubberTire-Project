@@ -421,6 +421,23 @@ public partial class RubberTireWheelScript
     internal float FactoryThrottle01() { return throttle01; }
     internal float FactoryBrake01() { return brake01; }
 
+    internal float FactoryDriveGripRatio(out float driveTorque, out float gripTorque)
+    {
+        driveTorque = drivenWheel ? Mathf.Abs(pendingDriveAxisTorque) : 0f;
+        float radius = treadPhysicsGeometryCached
+            ? Mathf.Max(1e-4f, treadRadiusWorld)
+            : 1f;
+        float longitudinalMu = MuKineticEff()
+            * (enableCombinedSlipFriction
+                ? Mathf.Max(0f, longitudinalGripScale)
+                : 1f);
+        gripTorque = longitudinalMu
+            * Mathf.Max(0f, factoryTireNormalLoad)
+            * radius;
+        if (gripTorque <= 1e-5f) return driveTorque > 1e-5f ? 999f : 0f;
+        return driveTorque / gripTorque;
+    }
+
     internal void FactoryContactQueryDiagnostics(
         out int rays, out int rawHits, out int acceptedHits, out int saturated)
     {

@@ -302,9 +302,26 @@ public partial class RubberTireWheelScript
                 leakScale = Mathf.Clamp01(slipSpeed / leakSpeed);
             }
 
-            Vector3 displacementRate = slipVelocity
-                                     - state.shearDispWorld * (leakScale / relaxationTime);
-            state.shearDispWorld += displacementRate * fixedDeltaTime;
+            // Integrate x' = v - leak*x/tau analytically. The former explicit
+            // Euler step becomes violently unstable when relaxLength / |slip|
+            // is shorter than the physics step (for example 0.05 / 41.5 is
+            // only 1.2 ms). The exact exponential update is passive for every
+            // dt and cannot bounce the brush displacement across equilibrium.
+            Vector3 previousShear = state.shearDispWorld;
+            if (leakScale > 1e-5f)
+            {
+                float decayRate = leakScale / relaxationTime;
+                float decay = Mathf.Exp(-decayRate * fixedDeltaTime);
+                Vector3 equilibriumShear = slipVelocity / decayRate;
+                state.shearDispWorld = equilibriumShear
+                    + (previousShear - equilibriumShear) * decay;
+            }
+            else
+            {
+                state.shearDispWorld += slipVelocity * fixedDeltaTime;
+            }
+            Vector3 displacementRate = (state.shearDispWorld - previousShear)
+                                     / Mathf.Max(1e-5f, fixedDeltaTime);
 
             if (maxShearDisp > 1e-5f)
             {
@@ -382,7 +399,8 @@ public partial class RubberTireWheelScript
 
             if (forceFilterTau > 1e-5f)
             {
-                float filterAlpha = fixedDeltaTime / (forceFilterTau + fixedDeltaTime);
+                float filterAlpha = 1f - Mathf.Exp(
+                    -fixedDeltaTime / Mathf.Max(1e-5f, forceFilterTau));
                 state.FtireFiltered = Vector3.Lerp(state.FtireFiltered, rawForce, filterAlpha);
                 tireForce = state.FtireFiltered;
             }
@@ -511,21 +529,9 @@ public partial class RubberTireWheelScript
         if (lockBlend <= 1e-4f)
         {
             ResetStaticConstraintHistory(state);
-            // This is unambiguously sliding contact. A relaxation brush can
-            // under-shoot badly when wheel spin rises faster than rolled
-            // distance (creep fades before the brush has built), creating the
-            // observed ~10 km/h traction hole. Sliding friction must already
-            // be on the kinetic ellipse, independent of that history.
-            Vector3 slidingForce = BuildKineticTireForce(
-                slipVelocity, forward, side, normalLoad);
-            if (slidingForce.sqrMagnitude > 1e-10f)
-                ApplyTireForce(slidingForce, wheelPoint, groundPoint, groundBody, wheelAxis);
-            if (enableTireRelaxation)
-            {
-                state.FtireFiltered = slidingForce;
-                if (shearK > 1e-6f) state.shearDispWorld = -slidingForce / shearK;
-            }
-            return slidingForce;
+            if (dynamicForce.sqrMagnitude > 1e-10f)
+                ApplyTireForce(dynamicForce, wheelPoint, groundPoint, groundBody, wheelAxis);
+            return dynamicForce;
         }
 
         // B1: feed the self-applied propulsion torque of THIS step forward so

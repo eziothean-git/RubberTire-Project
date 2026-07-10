@@ -99,6 +99,8 @@ public partial class RubberTireWheelScript : BlockScript
 
     // B3: raycast contact result of the previous fixed step (rolling damping gate).
     private bool lastStepHadRaycastContact;
+    private int consecutiveNoContactSteps;
+    private const int ShearResetNoContactSteps = 3;
 
     // A5: immediate joint parent (steering knuckle, suspension arm, chassis...).
     private Rigidbody jointParentBody;
@@ -250,6 +252,7 @@ public partial class RubberTireWheelScript : BlockScript
         lastRaycastAcceptedHitCount = 0;
         lastRaycastSaturatedCount = 0;
         lastStepHadRaycastContact = false;
+        consecutiveNoContactSteps = 0;
         jointParentCached = false;
         jointParentBody = null;
 
@@ -283,6 +286,7 @@ public partial class RubberTireWheelScript : BlockScript
         engineLimiterCut = false;
         currentEngineRpm = 0f;
         lastStepHadRaycastContact = false;
+        consecutiveNoContactSteps = 0;
         jointParentCached = false;
         jointParentBody = null;
 
@@ -416,15 +420,23 @@ public partial class RubberTireWheelScript : BlockScript
 
         if (topSamples.Count == 0)
         {
+            consecutiveNoContactSteps++;
             // 没命中：全部衰减
             ApplyAxleSpinStabilization(0f, 0f, GetDriveAxisWorld());
-            if (resetShearOnNoContact) pointStates.Clear();
+            // A single adaptive-ray miss must not erase the relaxation/filter
+            // state. That rebuilt force from zero every other step and turned
+            // longitudinal grip into a weak high-frequency pulse train.
+            if (resetShearOnNoContact
+                && consecutiveNoContactSteps >= ShearResetNoContactSteps)
+                pointStates.Clear();
             DecayAndCleanupColliderStates();
             dbgHasLocal = false;
             CleanupPointStates();
             HideDebugObjects();
             return;
         }
+
+        consecutiveNoContactSteps = 0;
 
         // ===== 2) Update per-collider gate + normal filter based on current contacts =====
         UpdateColliderStatesFromSamples(topSamples);

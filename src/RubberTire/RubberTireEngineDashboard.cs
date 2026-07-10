@@ -267,6 +267,10 @@ public sealed class RubberTireEngineDashboard : MonoBehaviour
             if (wheel == null) continue;
             bool driven = wheel.FactoryIsDrivenWheel();
             Vector3 position = wheel.transform.position;
+            float driveTorque;
+            float gripTorque;
+            float driveGripRatio = wheel.FactoryDriveGripRatio(
+                out driveTorque, out gripTorque);
             row.Identity.text = "W" + (i + 1).ToString("00")
                 + (driven ? "  DRIVE" : "  FREE / BRAKE");
             row.Telemetry.text = driven
@@ -275,7 +279,9 @@ public sealed class RubberTireEngineDashboard : MonoBehaviour
                     + "\nTHR " + Mathf.RoundToInt(wheel.FactoryThrottle01() * 100f) + "%"
                     + "   BRK " + Mathf.RoundToInt(wheel.FactoryBrake01() * 100f) + "%"
                     + (wheel.FactoryLimiterCut() ? "  LIMIT" : "")
-                    + "\nworld x/z " + position.x.ToString("0.0") + " / " + position.z.ToString("0.0")
+                    + "\nGRIP x" + driveGripRatio.ToString("0.0")
+                    + "   axle/cap " + driveTorque.ToString("0")
+                    + "/" + gripTorque.ToString("0")
                 : "BRK " + Mathf.RoundToInt(wheel.FactoryBrake01() * 100f) + "%"
                     + "\nworld x/z " + position.x.ToString("0.0") + " / " + position.z.ToString("0.0")
                     + "\nno propulsion torque";
