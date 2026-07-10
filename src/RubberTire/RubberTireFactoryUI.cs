@@ -228,6 +228,21 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         Image rootImage = root.GetComponent<Image>();
         if (rootImage != null) rootImage.color = PanelColor;
 
+        // Block Mapper owns a full-screen modal raycast layer. Give the lab its
+        // own top-level canvas/raycaster so controls rendered above that layer
+        // also receive pointer input above it.
+        Canvas labCanvas = root.GetComponent<Canvas>();
+        if (labCanvas == null) labCanvas = root.AddComponent<Canvas>();
+        labCanvas.overrideSorting = true;
+        labCanvas.sortingOrder = 30000;
+        if (root.GetComponent<GraphicRaycaster>() == null)
+            root.AddComponent<GraphicRaycaster>();
+        CanvasGroup labGroup = root.GetComponent<CanvasGroup>();
+        if (labGroup == null) labGroup = root.AddComponent<CanvasGroup>();
+        labGroup.interactable = true;
+        labGroup.blocksRaycasts = true;
+        root.transform.SetAsLastSibling();
+
         CreateText(root.transform, "RUBBER TIRE LAB", 22, FontStyle.Bold,
             new Vector2(18f, -12f), new Vector2(500f, 34f), TextAnchor.MiddleLeft, Color.white);
         CreateText(root.transform, "UIFactory workspace  |  F9 = live panel in simulation",
@@ -520,11 +535,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         CreateText(rect, setting.Label, 11, FontStyle.Normal,
             new Vector2(10f, -2f), new Vector2(210f, 22f), TextAnchor.MiddleLeft, Color.white);
 
-        GameObject inputObject = Make.Prefab("UIFactory3", "Input Field", rect);
-        RectTransform inputRect = inputObject.GetComponent<RectTransform>();
-        SetTopLeftRect(inputRect, new Vector2(224f, -3f), new Vector2(81f, 22f));
-        row.Input = inputObject.GetComponent<InputField>();
-        row.Input.contentType = InputField.ContentType.DecimalNumber;
+        row.Input = CreateNumericInput(rect, new Vector2(224f, -3f), new Vector2(81f, 22f));
         row.Input.text = FormatValue(setting.GetFloat());
 
         row.Slider = CreateSlider(rect, new Vector2(10f, -31f), new Vector2(295f, 16f));
@@ -893,6 +904,13 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
     {
         RectTransform rect = CreateRectObject("Slider", parent, topLeft, size);
 
+        // Put the raycast target on the same object as Slider. Previously only
+        // the 4 px track and 10 px handle were graphics; in a ScrollRect the
+        // remaining visible row sent the drag to scrolling/modal UI instead.
+        Image hitArea = rect.gameObject.AddComponent<Image>();
+        hitArea.color = new Color(1f, 1f, 1f, 0.001f);
+        hitArea.raycastTarget = true;
+
         GameObject trackObject = new GameObject("Track", typeof(RectTransform), typeof(CanvasRenderer), typeof(Image));
         trackObject.layer = rect.gameObject.layer;
         RectTransform trackRect = trackObject.GetComponent<RectTransform>();
@@ -902,7 +920,9 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         trackRect.pivot = new Vector2(0.5f, 0.5f);
         trackRect.anchoredPosition = Vector2.zero;
         trackRect.sizeDelta = new Vector2(0f, 4f);
-        trackObject.GetComponent<Image>().color = new Color(0.16f, 0.19f, 0.22f, 1f);
+        Image trackImage = trackObject.GetComponent<Image>();
+        trackImage.color = new Color(0.16f, 0.19f, 0.22f, 1f);
+        trackImage.raycastTarget = false;
 
         GameObject handleArea = new GameObject("Handle Slide Area", typeof(RectTransform));
         handleArea.layer = rect.gameObject.layer;
@@ -920,13 +940,53 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         handleRect.sizeDelta = new Vector2(10f, 14f);
         Image handleImage = handleObject.GetComponent<Image>();
         handleImage.color = AccentColor;
+        handleImage.raycastTarget = true;
 
         UISlider slider = rect.gameObject.AddComponent<UISlider>();
         slider.targetGraphic = handleImage;
         slider.handleRect = handleRect;
         slider.minValue = 0f;
         slider.maxValue = 1f;
+        slider.wholeNumbers = false;
+        slider.direction = UISlider.Direction.LeftToRight;
+        slider.interactable = true;
+        Navigation navigation = slider.navigation;
+        navigation.mode = Navigation.Mode.None;
+        slider.navigation = navigation;
         return slider;
+    }
+
+    private InputField CreateNumericInput(Transform parent, Vector2 topLeft, Vector2 size)
+    {
+        RectTransform rect = CreateRectObject("Numeric Input", parent, topLeft, size);
+        Image background = rect.gameObject.AddComponent<Image>();
+        background.color = new Color(0.025f, 0.03f, 0.035f, 1f);
+        background.raycastTarget = true;
+
+        Text valueText = CreateText(rect, "", 11, FontStyle.Normal,
+            new Vector2(5f, -1f), new Vector2(size.x - 10f, size.y - 2f),
+            TextAnchor.MiddleRight, Color.white);
+        valueText.name = "Text";
+        valueText.supportRichText = false;
+        valueText.horizontalOverflow = HorizontalWrapMode.Overflow;
+        valueText.verticalOverflow = VerticalWrapMode.Truncate;
+
+        Text placeholder = CreateText(rect, "-", 11, FontStyle.Normal,
+            new Vector2(5f, -1f), new Vector2(size.x - 10f, size.y - 2f),
+            TextAnchor.MiddleRight, MutedColor);
+        placeholder.name = "Placeholder";
+
+        InputField input = rect.gameObject.AddComponent<InputField>();
+        input.targetGraphic = background;
+        input.textComponent = valueText;
+        input.placeholder = placeholder;
+        input.contentType = InputField.ContentType.DecimalNumber;
+        input.lineType = InputField.LineType.SingleLine;
+        input.interactable = true;
+        Navigation navigation = input.navigation;
+        navigation.mode = Navigation.Mode.None;
+        input.navigation = navigation;
+        return input;
     }
 
     // =========================
