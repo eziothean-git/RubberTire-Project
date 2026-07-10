@@ -9,6 +9,7 @@ public partial class RubberTireWheelScript
     public float driveTorque = 0f;
 
     public bool enableDriveBrake = true;
+    public bool drivenWheel = true;
     public bool invertDriveTorque = false;
     public bool enableEngineCurve = true;
     public float enginePeakTorque = 450f;
@@ -19,7 +20,9 @@ public partial class RubberTireWheelScript
     public float engineIdleRpm = 900f;
     public float engineRedlineRpm = 7500f;
     public float engineLimiterHysteresisRpm = 250f;
+    public float engineRpmFilterTau = 0.05f;
     public float engineCoastTorque = 20f;
+    public bool smoothEngineTorqueLut = true;
     public float finalDriveRatio = 10f;
     public float drivetrainEfficiency = 0.90f;
     public string engineTorqueLut = DefaultEngineTorqueLut;
@@ -33,6 +36,7 @@ public partial class RubberTireWheelScript
     public float gearRatio6 = 0.75f;
     public float gearRatio7 = 0.55f;
     public float gearRatio8 = 0.40f;
+    public float reverseGearRatio = 3.50f;
 
     public bool enableRollingDamping = false;
     public float rollingDampingK = 0.25f;
@@ -71,6 +75,9 @@ public partial class RubberTireWheelScript
     private const float RadPerSecondPerRpm = 0.10471976f;
     private readonly float[] engineLutRpm = new float[MaximumEngineLutPoints];
     private readonly float[] engineLutTorque = new float[MaximumEngineLutPoints];
+    private readonly float[] engineLutSlope = new float[MaximumEngineLutPoints];
+    private readonly float[] engineLutSpan = new float[MaximumEngineLutPoints - 1];
+    private readonly float[] engineLutSecant = new float[MaximumEngineLutPoints - 1];
     private int engineLutPointCount;
     private string parsedEngineTorqueLut;
 
@@ -81,6 +88,17 @@ public partial class RubberTireWheelScript
         uiKeyReverse = AddKey("Reverse Key", "kRev", KeyCode.R);
         uiKeyGearUp = AddKey("Shift Up Key", "kGUp", KeyCode.PageUp);
         uiKeyGearDown = AddKey("Shift Down Key", "kGDn", KeyCode.PageDown);
+        UpdateDriveKeyVisibility();
+    }
+
+    internal void UpdateDriveKeyVisibility()
+    {
+        if (uiKeyThrottle != null) uiKeyThrottle.DisplayInMapper = drivenWheel;
+        if (uiKeyReverse != null) uiKeyReverse.DisplayInMapper = drivenWheel;
+        if (uiKeyGearUp != null) uiKeyGearUp.DisplayInMapper = drivenWheel;
+        if (uiKeyGearDown != null) uiKeyGearDown.DisplayInMapper = drivenWheel;
+        // Brake remains available for both driven and free-rolling wheels.
+        if (uiKeyBrake != null) uiKeyBrake.DisplayInMapper = true;
     }
 
     // B1: wheel-axis PROPULSION torque self-applied this step.  The static
@@ -93,9 +111,9 @@ public partial class RubberTireWheelScript
     private void ApplyDriveBrake()
     {
         float dt = Time.fixedDeltaTime;
-        bool heldThr = enableDriveBrake && uiKeyThrottle != null && uiKeyThrottle.IsHeld;
+        bool driveActive = enableDriveBrake && drivenWheel;
+        bool heldThr = driveActive && uiKeyThrottle != null && uiKeyThrottle.IsHeld;
         bool heldBrk = enableDriveBrake && uiKeyBrake != null && uiKeyBrake.IsHeld;
-        bool heldRev = enableDriveBrake && uiKeyReverse != null && uiKeyReverse.IsHeld;
         UpdateGearboxInput();
 
         float targetThr = heldThr ? 1f : 0f;
@@ -115,12 +133,20 @@ public partial class RubberTireWheelScript
         if (parentBody != null)
             omegaAxis -= Vector3.Dot(parentBody.angularVelocity, driveAxis);
         float totalRatio = GetCurrentTotalDriveRatio();
-        float engineRpm = Mathf.Abs(omegaAxis) * totalRatio * RpmPerRadPerSecond;
-        currentEngineRpm = engineRpm;
-        UpdateEngineLimiter(engineRpm);
-        float engineTorque = enableEngineCurve
+        float rawEngineRpm = drivenWheel
+            ? Mathf.Abs(omegaAxis) * totalRatio * RpmPerRadPerSecond
+            : 0f;
+        float rpmFilter = Mathf.Max(0f, engineRpmFilterTau);
+        float rpmAlpha = rpmFilter > 1e-5f
+            ? 1f - Mathf.Exp(-dt / rpmFilter)
+            : 1f;
+        currentEngineRpm = Mathf.Lerp(currentEngineRpm, rawEngineRpm, rpmAlpha);
+        float engineRpm = currentEngineRpm;
+        if (drivenWheel) UpdateEngineLimiter(engineRpm);
+        else engineLimiterCut = false;
+        float engineTorque = drivenWheel && enableEngineCurve
             ? EvaluateEngineTorque(Mathf.Max(engineIdleRpm, engineRpm))
-            : Mathf.Max(0f, enginePeakTorque);
+            : (drivenWheel ? Mathf.Max(0f, enginePeakTorque) : 0f);
         if (engineLimiterCut) engineTorque = 0f;
         float transmissionScale = totalRatio * Mathf.Clamp01(drivetrainEfficiency);
         float engineTorqueAtWheel = engineTorque * transmissionScale;
@@ -128,7 +154,7 @@ public partial class RubberTireWheelScript
 
         float driveSign = (Flipped ? -1f : 1f)
                         * (invertDriveTorque ? -1f : 1f)
-                        * (heldRev ? -1f : 1f);
+                        * (currentGear == 0 ? -1f : 1f);
         // Brake input wins over throttle instead of making the two fight at
         // the axle while the inputs are ramping in opposite directions.
         tauDriveCmd *= driveSign * (1f - Mathf.Clamp01(brake01));
@@ -137,7 +163,8 @@ public partial class RubberTireWheelScript
         // feed-forward. Braking and coast are dissipative wheel torques.
         float tauDrive = ClampSpinPumpingTorque(tauDriveCmd, omegaAxisAbs, driveAxis, dt);
         float tauCoast = 0f;
-        if (engineCoastTorque > 0f
+        if (drivenWheel
+            && engineCoastTorque > 0f
             && throttle01 < 0.999f
             && Mathf.Abs(omegaAxis) > Mathf.Max(1e-4f, brakeDeadbandOmega))
         {
@@ -212,7 +239,25 @@ public partial class RubberTireWheelScript
             if (rpm > engineLutRpm[i]) continue;
             float span = Mathf.Max(1e-4f, engineLutRpm[i] - engineLutRpm[i - 1]);
             float u = Mathf.Clamp01((rpm - engineLutRpm[i - 1]) / span);
-            return Mathf.Max(0f, Mathf.Lerp(engineLutTorque[i - 1], engineLutTorque[i], u));
+            if (!smoothEngineTorqueLut)
+                return Mathf.Max(0f, Mathf.Lerp(engineLutTorque[i - 1], engineLutTorque[i], u));
+
+            float u2 = u * u;
+            float u3 = u2 * u;
+            float h00 = 2f * u3 - 3f * u2 + 1f;
+            float h10 = u3 - 2f * u2 + u;
+            float h01 = -2f * u3 + 3f * u2;
+            float h11 = u3 - u2;
+            float torque = h00 * engineLutTorque[i - 1]
+                         + h10 * span * engineLutSlope[i - 1]
+                         + h01 * engineLutTorque[i]
+                         + h11 * span * engineLutSlope[i];
+            // PCHIP should be shape preserving; this final clamp also guards
+            // against float noise on extremely close RPM points.
+            torque = Mathf.Clamp(torque,
+                Mathf.Min(engineLutTorque[i - 1], engineLutTorque[i]),
+                Mathf.Max(engineLutTorque[i - 1], engineLutTorque[i]));
+            return Mathf.Max(0f, torque);
         }
         return Mathf.Max(0f, engineLutTorque[engineLutPointCount - 1]);
     }
@@ -258,6 +303,16 @@ public partial class RubberTireWheelScript
                     CultureInfo.InvariantCulture, out torque)) continue;
             if (rpm < 0f || torque < 0f) continue;
 
+            bool replacedDuplicate = false;
+            for (int p = 0; p < engineLutPointCount; p++)
+            {
+                if (Mathf.Abs(engineLutRpm[p] - rpm) > 0.01f) continue;
+                engineLutTorque[p] = torque;
+                replacedDuplicate = true;
+                break;
+            }
+            if (replacedDuplicate) continue;
+
             int insert = engineLutPointCount;
             while (insert > 0 && rpm < engineLutRpm[insert - 1])
             {
@@ -269,6 +324,7 @@ public partial class RubberTireWheelScript
             engineLutTorque[insert] = torque;
             engineLutPointCount++;
         }
+        RebuildEngineLutSlopes();
         return engineLutPointCount >= 2;
     }
 
@@ -321,8 +377,72 @@ public partial class RubberTireWheelScript
         return true;
     }
 
+    internal bool FactoryAddEngineLutPoint(int selectedIndex, out int newIndex)
+    {
+        newIndex = -1;
+        if (!EnsureEngineTorqueLut() || engineLutPointCount >= MaximumEngineLutPoints)
+            return false;
+
+        int left = 0;
+        int right = 1;
+        if (selectedIndex >= 0 && selectedIndex < engineLutPointCount)
+        {
+            if (selectedIndex + 1 < engineLutPointCount)
+            {
+                left = selectedIndex;
+                right = selectedIndex + 1;
+            }
+            else
+            {
+                left = selectedIndex - 1;
+                right = selectedIndex;
+            }
+        }
+        else
+        {
+            float largestGap = -1f;
+            for (int i = 0; i + 1 < engineLutPointCount; i++)
+            {
+                float gap = engineLutRpm[i + 1] - engineLutRpm[i];
+                if (gap <= largestGap) continue;
+                largestGap = gap;
+                left = i;
+                right = i + 1;
+            }
+        }
+
+        float rpm = 0.5f * (engineLutRpm[left] + engineLutRpm[right]);
+        float torque = EvaluateEngineTorque(rpm);
+        newIndex = right;
+        for (int i = engineLutPointCount; i > newIndex; i--)
+        {
+            engineLutRpm[i] = engineLutRpm[i - 1];
+            engineLutTorque[i] = engineLutTorque[i - 1];
+        }
+        engineLutRpm[newIndex] = rpm;
+        engineLutTorque[newIndex] = torque;
+        engineLutPointCount++;
+        RebuildEngineTorqueLutText();
+        return true;
+    }
+
+    internal bool FactoryRemoveEngineLutPoint(int index)
+    {
+        if (!EnsureEngineTorqueLut() || engineLutPointCount <= 2
+            || index < 0 || index >= engineLutPointCount) return false;
+        for (int i = index; i + 1 < engineLutPointCount; i++)
+        {
+            engineLutRpm[i] = engineLutRpm[i + 1];
+            engineLutTorque[i] = engineLutTorque[i + 1];
+        }
+        engineLutPointCount--;
+        RebuildEngineTorqueLutText();
+        return true;
+    }
+
     private void RebuildEngineTorqueLutText()
     {
+        RebuildEngineLutSlopes();
         StringBuilder builder = new StringBuilder(engineLutPointCount * 18);
         for (int i = 0; i < engineLutPointCount; i++)
         {
@@ -335,6 +455,59 @@ public partial class RubberTireWheelScript
         parsedEngineTorqueLut = engineTorqueLut;
     }
 
+    private void RebuildEngineLutSlopes()
+    {
+        if (engineLutPointCount <= 0) return;
+        if (engineLutPointCount == 1)
+        {
+            engineLutSlope[0] = 0f;
+            return;
+        }
+
+        for (int i = 0; i + 1 < engineLutPointCount; i++)
+        {
+            engineLutSpan[i] = Mathf.Max(1e-4f, engineLutRpm[i + 1] - engineLutRpm[i]);
+            engineLutSecant[i] = (engineLutTorque[i + 1] - engineLutTorque[i]) / engineLutSpan[i];
+        }
+
+        if (engineLutPointCount == 2)
+        {
+            engineLutSlope[0] = engineLutSecant[0];
+            engineLutSlope[1] = engineLutSecant[0];
+            return;
+        }
+
+        engineLutSlope[0] = ShapePreservingEndpointSlope(
+            engineLutSpan[0], engineLutSpan[1], engineLutSecant[0], engineLutSecant[1]);
+        for (int i = 1; i + 1 < engineLutPointCount; i++)
+        {
+            float before = engineLutSecant[i - 1];
+            float after = engineLutSecant[i];
+            if (before * after <= 0f)
+            {
+                engineLutSlope[i] = 0f;
+                continue;
+            }
+            float w1 = 2f * engineLutSpan[i] + engineLutSpan[i - 1];
+            float w2 = engineLutSpan[i] + 2f * engineLutSpan[i - 1];
+            engineLutSlope[i] = (w1 + w2) / (w1 / before + w2 / after);
+        }
+        int last = engineLutPointCount - 1;
+        engineLutSlope[last] = ShapePreservingEndpointSlope(
+            engineLutSpan[last - 1], engineLutSpan[last - 2],
+            engineLutSecant[last - 1], engineLutSecant[last - 2]);
+    }
+
+    private static float ShapePreservingEndpointSlope(
+        float h0, float h1, float d0, float d1)
+    {
+        float slope = ((2f * h0 + h1) * d0 - h0 * d1) / Mathf.Max(1e-4f, h0 + h1);
+        if (slope * d0 <= 0f) return 0f;
+        if (d0 * d1 < 0f && Mathf.Abs(slope) > Mathf.Abs(3f * d0))
+            return 3f * d0;
+        return slope;
+    }
+
     private float SmoothStep01(float value)
     {
         float u = Mathf.Clamp01(value);
@@ -345,9 +518,16 @@ public partial class RubberTireWheelScript
     {
         int count = GetGearCount();
         currentGear = ClampGear(currentGear, count);
-        if (!enableDriveBrake || !enableGearbox) return;
+        if (!enableDriveBrake || !drivenWheel) return;
+
+        if (uiKeyReverse != null && uiKeyReverse.IsPressed)
+        {
+            currentGear = currentGear == 0 ? 1 : 0;
+            return;
+        }
+        if (!enableGearbox) return;
         if (uiKeyGearUp != null && uiKeyGearUp.IsPressed)
-            currentGear = ClampGear(currentGear + 1, count);
+            currentGear = currentGear == 0 ? 1 : ClampGear(currentGear + 1, count);
         if (uiKeyGearDown != null && uiKeyGearDown.IsPressed)
             currentGear = ClampGear(currentGear - 1, count);
     }
@@ -363,13 +543,15 @@ public partial class RubberTireWheelScript
     private int ClampGear(int gear, int count)
     {
         if (count < 1) count = 1;
-        if (gear < 1) return 1;
+        if (gear < 0) return 0;
         if (gear > count) return count;
         return gear;
     }
 
     private float GetCurrentGearRatio()
     {
+        if (currentGear == 0)
+            return enableGearbox ? Mathf.Max(0.05f, reverseGearRatio) : 1f;
         if (!enableGearbox) return 1f;
         int count = GetGearCount();
         currentGear = ClampGear(currentGear, count);
@@ -396,6 +578,7 @@ public partial class RubberTireWheelScript
     {
         switch (gear)
         {
+            case 0: return reverseGearRatio;
             case 1: return gearRatio1;
             case 2: return gearRatio2;
             case 3: return gearRatio3;

@@ -77,6 +77,10 @@ public partial class RubberTireWheelScript
     private float factoryTireLongForce;
     private float factoryTireLatForce;
     private float factoryTireNormalLoad;
+    private float factoryTireLongSlip;
+    private float factoryTireSideSlip;
+    private float factoryStaticLockBlend;
+    private bool factoryStaticConstraintSolved;
 
     // Global solver constants, not per-tyre tuning parameters.
     private const float StaticLockFullSpeed = 0.30f;
@@ -118,6 +122,10 @@ public partial class RubberTireWheelScript
         factoryTireLongForce = 0f;
         factoryTireLatForce = 0f;
         factoryTireNormalLoad = 0f;
+        factoryTireLongSlip = 0f;
+        factoryTireSideSlip = 0f;
+        factoryStaticLockBlend = 0f;
+        factoryStaticConstraintSolved = false;
         activeMuScale = 1f;
     }
 
@@ -267,6 +275,10 @@ public partial class RubberTireWheelScript
 
         Vector3 slipVelocity = ProjectOnPlane(relativeVelocity, contactNormal);
         float slipSpeed = slipVelocity.magnitude;
+        factoryTireLongSlip = Vector3.Dot(slipVelocity, forward);
+        factoryTireSideSlip = side.sqrMagnitude > 1e-8f
+            ? Vector3.Dot(slipVelocity, side)
+            : 0f;
         TirePointState state = GetOrCreatePatchState(
             patchKey,
             sample.p,
@@ -445,18 +457,23 @@ public partial class RubberTireWheelScript
         float normalLoad,
         float fixedDeltaTime)
     {
-        Vector3 groundLinearVelocity = groundBody != null
-            ? groundBody.GetPointVelocity(point)
-            : Vector3.zero;
-        Vector3 rollingVelocity = ProjectOnPlane(
-            Rigidbody.velocity - groundLinearVelocity,
-            contactNormal);
-        float rollingSpeed = rollingVelocity.magnitude;
+        // Static friction is a contact-patch state, not a vehicle-speed state.
+        // Pure rolling can stick at any road speed; using Rigidbody.velocity
+        // here created a hard low-speed band where the bespoke constraint
+        // replaced the working brush model, then vanished around 1 m/s.
+        float slipForward = Vector3.Dot(slipVelocity, forward);
+        float slipSide = side.sqrMagnitude > 1e-8f
+            ? Vector3.Dot(slipVelocity, side)
+            : 0f;
+        float constraintSlipSpeed = Mathf.Sqrt(
+            slipForward * slipForward + slipSide * slipSide);
 
         float lockBlend = 1f - Mathf.Clamp01(
-            (rollingSpeed - StaticLockFullSpeed)
+            (constraintSlipSpeed - StaticLockFullSpeed)
             / Mathf.Max(1e-4f, StaticLockOffSpeed - StaticLockFullSpeed));
         lockBlend = lockBlend * lockBlend * (3f - 2f * lockBlend);
+        factoryStaticLockBlend = lockBlend;
+        factoryStaticConstraintSolved = false;
 
         if (!enableModernLowSpeedTire || lockBlend <= 1e-4f)
         {
@@ -499,10 +516,35 @@ public partial class RubberTireWheelScript
         if (!canStick)
         {
             ResetStaticConstraintHistory(state);
-            if (dynamicForce.sqrMagnitude > 1e-10f)
-                ApplyTireForce(dynamicForce, point, groundBody, wheelAxis);
-            return dynamicForce;
+            // AddTorque is integrated after scripts, so dynamicForce only sees
+            // the OLD slip. Include this step's known drive disturbance; when
+            // sticking is overloaded, transmit kinetic-limit traction now
+            // instead of returning zero for one frame and letting wheel speed
+            // overshoot/oscillate.
+            Vector3 predictedSlip = slipVelocity
+                + forward * feedForwardForward
+                + side * feedForwardSide;
+            Vector3 fallbackForce = dynamicForce;
+            if (predictedSlip.sqrMagnitude > 1e-10f)
+            {
+                if (enableCombinedSlipFriction && side.sqrMagnitude > 1e-6f)
+                {
+                    fallbackForce = BuildCombinedKineticFriction(
+                        predictedSlip, forward, side,
+                        MuKineticEff() * Mathf.Max(0f, longitudinalGripScale) * normalLoad,
+                        MuKineticEff() * Mathf.Max(0f, lateralGripScale) * normalLoad);
+                }
+                else
+                {
+                    fallbackForce = -predictedSlip.normalized
+                        * (MuKineticEff() * normalLoad);
+                }
+            }
+            if (fallbackForce.sqrMagnitude > 1e-10f)
+                ApplyTireForce(fallbackForce, point, groundBody, wheelAxis);
+            return fallbackForce;
         }
+        factoryStaticConstraintSolved = true;
 
         Vector3 dynamicImpulse = dynamicForce * fixedDeltaTime;
         Vector3 blendedImpulse = Vector3.Lerp(dynamicImpulse, staticImpulse, lockBlend);

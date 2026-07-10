@@ -27,6 +27,8 @@ namespace RubberTire
 
             if (controllerRoot.GetComponent<global::RubberTireFactoryUIController>() == null)
                 controllerRoot.AddComponent<global::RubberTireFactoryUIController>();
+            if (controllerRoot.GetComponent<global::RubberTireEngineDashboard>() == null)
+                controllerRoot.AddComponent<global::RubberTireEngineDashboard>();
         }
     }
 }

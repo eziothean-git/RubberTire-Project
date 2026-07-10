@@ -96,9 +96,10 @@ public partial class RubberTireWheelScript
     {
         List<RubberTireFactorySetting> s = new List<RubberTireFactorySetting>(96);
 
-        Func<bool> whenEngineCurve = delegate { return enableEngineCurve; };
-        Func<bool> whenConstantEngine = delegate { return !enableEngineCurve; };
-        Func<bool> whenGearbox = delegate { return enableGearbox; };
+        Func<bool> whenDriven = delegate { return drivenWheel; };
+        Func<bool> whenEngineCurve = delegate { return drivenWheel && enableEngineCurve; };
+        Func<bool> whenConstantEngine = delegate { return drivenWheel && !enableEngineCurve; };
+        Func<bool> whenGearbox = delegate { return drivenWheel && enableGearbox; };
         Func<bool> whenRolling = delegate { return enableRollingDamping; };
         Func<bool> whenCombinedSlip = delegate { return enableCombinedSlipFriction; };
         Func<bool> whenModernLowSpeed = delegate { return enableModernLowSpeedTire; };
@@ -111,36 +112,40 @@ public partial class RubberTireWheelScript
         Func<bool> whenLoadSensitivity = delegate { return muLoadSensitivity > 1e-4f; };
 
         // ===== Engine =====
-        s.Add(FactoryBool("Engine", "drv", "Drive / brake enabled", delegate { return enableDriveBrake; }, delegate(bool v) { enableDriveBrake = v; }).In("Engine"));
-        s.Add(FactoryBool("Engine", "invDrv", "Invert drive torque", delegate { return invertDriveTorque; }, delegate(bool v) { invertDriveTorque = v; }).In("Engine"));
-        s.Add(FactoryBool("Engine", "engCurve", "AC-style torque LUT", delegate { return enableEngineCurve; }, delegate(bool v) { enableEngineCurve = v; }).In("Engine").Tip("On = interpolate RPM|Nm rows from the curve editor; off = constant torque"));
+        s.Add(FactoryBool("Engine", "drv", "Powertrain / brake controls", delegate { return enableDriveBrake; }, delegate(bool v) { enableDriveBrake = v; }).In("Mode"));
+        s.Add(FactoryBool("Engine", "driven", "Driven wheel", delegate { return drivenWheel; }, delegate(bool v) { drivenWheel = v; UpdateDriveKeyVisibility(); }).In("Mode").Tip("Off removes propulsion, engine braking and shift controls; the service brake remains active"));
+        s.Add(FactoryBool("Engine", "invDrv", "Invert drive torque", delegate { return invertDriveTorque; }, delegate(bool v) { invertDriveTorque = v; }).In("Engine").When(whenDriven));
+        s.Add(FactoryBool("Engine", "engCurve", "AC-style torque LUT", delegate { return enableEngineCurve; }, delegate(bool v) { enableEngineCurve = v; }).In("Engine").When(whenDriven).Tip("On = interpolate RPM|Nm rows from the curve editor; off = constant torque"));
+        s.Add(FactoryBool("Engine", "engSmooth", "Smooth LUT (PCHIP)", delegate { return smoothEngineTorqueLut; }, delegate(bool v) { smoothEngineTorqueLut = v; }).In("Engine").When(whenEngineCurve).Tip("Shape-preserving cubic interpolation: smooth derivatives without overshooting the key-point torques"));
         s.Add(FactoryFloat("Engine", "engT", "Constant torque (N m)", 0f, 50000f, delegate { return enginePeakTorque; }, delegate(float v) { enginePeakTorque = v; }).In("Engine").Curve().When(whenConstantEngine));
-        s.Add(FactoryFloat("Engine", "engIdle", "Idle RPM", 0f, 10000f, delegate { return engineIdleRpm; }, delegate(float v) { engineIdleRpm = v; }).In("Engine"));
-        s.Add(FactoryFloat("Engine", "engRed", "Limiter RPM", 200f, 25000f, delegate { return engineRedlineRpm; }, delegate(float v) { engineRedlineRpm = v; }).In("Engine"));
-        s.Add(FactoryFloat("Engine", "engHys", "Limiter hysteresis RPM", 1f, 2000f, delegate { return engineLimiterHysteresisRpm; }, delegate(float v) { engineLimiterHysteresisRpm = v; }).In("Engine").Adv().Tip("Fuel resumes this far below the limiter"));
-        s.Add(FactoryFloat("Engine", "engCoast", "Engine braking (N m)", 0f, 1000f, delegate { return engineCoastTorque; }, delegate(float v) { engineCoastTorque = v; }).In("Engine").Curve().Tip("Closed-throttle coast torque at the crank"));
+        s.Add(FactoryFloat("Engine", "engIdle", "Idle RPM", 0f, 10000f, delegate { return engineIdleRpm; }, delegate(float v) { engineIdleRpm = v; }).In("Engine").When(whenDriven));
+        s.Add(FactoryFloat("Engine", "engRed", "Limiter RPM", 200f, 25000f, delegate { return engineRedlineRpm; }, delegate(float v) { engineRedlineRpm = v; }).In("Engine").When(whenDriven));
+        s.Add(FactoryFloat("Engine", "engHys", "Limiter hysteresis RPM", 1f, 2000f, delegate { return engineLimiterHysteresisRpm; }, delegate(float v) { engineLimiterHysteresisRpm = v; }).In("Engine").Adv().When(whenDriven).Tip("Fuel resumes this far below the limiter"));
+        s.Add(FactoryFloat("Engine", "engRpmF", "RPM filter time (s)", 0f, 0.25f, delegate { return engineRpmFilterTau; }, delegate(float v) { engineRpmFilterTau = v; }).In("Engine").Adv().When(whenDriven).Tip("Low-pass filter for wheel-coupled engine RPM and torque lookup"));
+        s.Add(FactoryFloat("Engine", "engCoast", "Engine braking (N m)", 0f, 1000f, delegate { return engineCoastTorque; }, delegate(float v) { engineCoastTorque = v; }).In("Engine").Curve().When(whenDriven).Tip("Closed-throttle coast torque at the crank"));
 
         // ===== Gearbox =====
-        s.Add(FactoryBool("Engine", "gbx", "Gearbox", delegate { return enableGearbox; }, delegate(bool v) { enableGearbox = v; }).In("Gearbox"));
+        s.Add(FactoryBool("Engine", "gbx", "Gearbox", delegate { return enableGearbox; }, delegate(bool v) { enableGearbox = v; }).In("Gearbox").When(whenDriven));
         s.Add(FactoryFloat("Engine", "gCnt", "Gear count", 1f, 8f, delegate { return gearCount; }, delegate(float v) { gearCount = Mathf.Round(v); }).In("Gearbox").When(whenGearbox));
-        s.Add(FactoryFloat("Engine", "gFinal", "Final drive ratio", 0.05f, 30f, delegate { return finalDriveRatio; }, delegate(float v) { finalDriveRatio = v; }).In("Gearbox").Tip("Multiplies every gear for both engine RPM and wheel torque; Besiege's large wheels typically need 6-15"));
-        s.Add(FactoryFloat("Engine", "gEff", "Drivetrain efficiency", 0.1f, 1f, delegate { return drivetrainEfficiency; }, delegate(float v) { drivetrainEfficiency = v; }).In("Gearbox").Adv());
-        s.Add(FactoryFloat("Engine", "gR1", "Gear 1 ratio", 0.05f, 20f, delegate { return gearRatio1; }, delegate(float v) { gearRatio1 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 1; }));
-        s.Add(FactoryFloat("Engine", "gR2", "Gear 2 ratio", 0.05f, 20f, delegate { return gearRatio2; }, delegate(float v) { gearRatio2 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 2; }));
-        s.Add(FactoryFloat("Engine", "gR3", "Gear 3 ratio", 0.05f, 20f, delegate { return gearRatio3; }, delegate(float v) { gearRatio3 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 3; }));
-        s.Add(FactoryFloat("Engine", "gR4", "Gear 4 ratio", 0.05f, 20f, delegate { return gearRatio4; }, delegate(float v) { gearRatio4 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 4; }));
-        s.Add(FactoryFloat("Engine", "gR5", "Gear 5 ratio", 0.05f, 20f, delegate { return gearRatio5; }, delegate(float v) { gearRatio5 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 5; }));
-        s.Add(FactoryFloat("Engine", "gR6", "Gear 6 ratio", 0.05f, 20f, delegate { return gearRatio6; }, delegate(float v) { gearRatio6 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 6; }));
-        s.Add(FactoryFloat("Engine", "gR7", "Gear 7 ratio", 0.05f, 20f, delegate { return gearRatio7; }, delegate(float v) { gearRatio7 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 7; }));
-        s.Add(FactoryFloat("Engine", "gR8", "Gear 8 ratio", 0.05f, 20f, delegate { return gearRatio8; }, delegate(float v) { gearRatio8 = v; }).In("Gearbox").When(delegate { return enableGearbox && GetGearCount() >= 8; }));
+        s.Add(FactoryFloat("Engine", "gRev", "Reverse ratio", 0.05f, 20f, delegate { return reverseGearRatio; }, delegate(float v) { reverseGearRatio = v; }).In("Gearbox").When(whenGearbox));
+        s.Add(FactoryFloat("Engine", "gFinal", "Final drive ratio", 0.05f, 30f, delegate { return finalDriveRatio; }, delegate(float v) { finalDriveRatio = v; }).In("Gearbox").When(whenDriven).Tip("Multiplies every gear for both engine RPM and wheel torque; Besiege's large wheels typically need 6-15"));
+        s.Add(FactoryFloat("Engine", "gEff", "Drivetrain efficiency", 0.1f, 1f, delegate { return drivetrainEfficiency; }, delegate(float v) { drivetrainEfficiency = v; }).In("Gearbox").Adv().When(whenDriven));
+        s.Add(FactoryFloat("Engine", "gR1", "Gear 1 ratio", 0.05f, 20f, delegate { return gearRatio1; }, delegate(float v) { gearRatio1 = v; }).In("Gearbox").When(delegate { return drivenWheel && enableGearbox && GetGearCount() >= 1; }));
+        s.Add(FactoryFloat("Engine", "gR2", "Gear 2 ratio", 0.05f, 20f, delegate { return gearRatio2; }, delegate(float v) { gearRatio2 = v; }).In("Gearbox").When(delegate { return drivenWheel && enableGearbox && GetGearCount() >= 2; }));
+        s.Add(FactoryFloat("Engine", "gR3", "Gear 3 ratio", 0.05f, 20f, delegate { return gearRatio3; }, delegate(float v) { gearRatio3 = v; }).In("Gearbox").When(delegate { return drivenWheel && enableGearbox && GetGearCount() >= 3; }));
+        s.Add(FactoryFloat("Engine", "gR4", "Gear 4 ratio", 0.05f, 20f, delegate { return gearRatio4; }, delegate(float v) { gearRatio4 = v; }).In("Gearbox").When(delegate { return drivenWheel && enableGearbox && GetGearCount() >= 4; }));
+        s.Add(FactoryFloat("Engine", "gR5", "Gear 5 ratio", 0.05f, 20f, delegate { return gearRatio5; }, delegate(float v) { gearRatio5 = v; }).In("Gearbox").When(delegate { return drivenWheel && enableGearbox && GetGearCount() >= 5; }));
+        s.Add(FactoryFloat("Engine", "gR6", "Gear 6 ratio", 0.05f, 20f, delegate { return gearRatio6; }, delegate(float v) { gearRatio6 = v; }).In("Gearbox").When(delegate { return drivenWheel && enableGearbox && GetGearCount() >= 6; }));
+        s.Add(FactoryFloat("Engine", "gR7", "Gear 7 ratio", 0.05f, 20f, delegate { return gearRatio7; }, delegate(float v) { gearRatio7 = v; }).In("Gearbox").When(delegate { return drivenWheel && enableGearbox && GetGearCount() >= 7; }));
+        s.Add(FactoryFloat("Engine", "gR8", "Gear 8 ratio", 0.05f, 20f, delegate { return gearRatio8; }, delegate(float v) { gearRatio8 = v; }).In("Gearbox").When(delegate { return drivenWheel && enableGearbox && GetGearCount() >= 8; }));
 
         // ===== Brakes =====
         s.Add(FactoryFloat("Engine", "brkT", "Maximum brake torque", 0f, 80000f, delegate { return maxBrakeTorque; }, delegate(float v) { maxBrakeTorque = v; }).In("Brakes").Curve());
         s.Add(FactoryFloat("Engine", "brkDb", "Coast cutoff (rad/s)", 0f, 10f, delegate { return brakeDeadbandOmega; }, delegate(float v) { brakeDeadbandOmega = v; }).In("Brakes").Adv().Tip("Below this speed engine braking stops; service braking uses a non-reversing inertia clamp"));
 
         // ===== Response =====
-        s.Add(FactoryFloat("Engine", "thrUp", "Throttle rise (1/s)", 0f, 40f, delegate { return throttleRise; }, delegate(float v) { throttleRise = v; }).In("Response").Adv());
-        s.Add(FactoryFloat("Engine", "thrDn", "Throttle fall (1/s)", 0f, 40f, delegate { return throttleFall; }, delegate(float v) { throttleFall = v; }).In("Response").Adv());
+        s.Add(FactoryFloat("Engine", "thrUp", "Throttle rise (1/s)", 0f, 40f, delegate { return throttleRise; }, delegate(float v) { throttleRise = v; }).In("Response").Adv().When(whenDriven));
+        s.Add(FactoryFloat("Engine", "thrDn", "Throttle fall (1/s)", 0f, 40f, delegate { return throttleFall; }, delegate(float v) { throttleFall = v; }).In("Response").Adv().When(whenDriven));
         s.Add(FactoryFloat("Engine", "brkUp", "Brake rise (1/s)", 0f, 40f, delegate { return brakeRise; }, delegate(float v) { brakeRise = v; }).In("Response").Adv());
         s.Add(FactoryFloat("Engine", "brkDn", "Brake fall (1/s)", 0f, 40f, delegate { return brakeFall; }, delegate(float v) { brakeFall = v; }).In("Response").Adv());
 
@@ -196,7 +201,8 @@ public partial class RubberTireWheelScript
         // ===== Contact =====
         s.Add(FactoryBool("Contact", "tw-clip", "Tread-width clipping", delegate { return enableTreadWidthClip; }, delegate(bool v) { enableTreadWidthClip = v; }).In("Geometry"));
         s.Add(FactoryFloat("Contact", "tw", "Tread width", 0.05f, 5f, delegate { return treadWidth; }, delegate(float v) { treadWidth = v; }).In("Geometry").When(whenTreadClip));
-        s.Add(FactoryFloat("Contact", "rayR", "Radial ray count", 1f, 12f, delegate { return radialRayCount; }, delegate(float v) { radialRayCount = Mathf.RoundToInt(v); }).In("Geometry").Adv().Tip("Contact directions around the wheel; >1 enables walls / ceilings"));
+        s.Add(FactoryBool("Contact", "rayAdaptive", "Adaptive radial budget", delegate { return enableAdaptiveRadialSampling; }, delegate(bool v) { enableAdaptiveRadialSampling = v; }).In("Geometry").Adv().Tip("Samples ground + cached surface + one rotating probe instead of every sector every physics step"));
+        s.Add(FactoryFloat("Contact", "rayR", "Radial sector resolution", 1f, 12f, delegate { return radialRayCount; }, delegate(float v) { radialRayCount = Mathf.RoundToInt(v); }).In("Geometry").Adv().Tip("Angular resolution for walls / ceilings; adaptive mode keeps the per-step query budget small"));
         s.Add(FactoryBool("Contact", "advRay", "Tread ray fan", delegate { return enableTreadRayFan; }, delegate(bool v) { enableTreadRayFan = v; }).In("Geometry").Adv().When(whenTreadClip));
         s.Add(FactoryFloat("Contact", "rayN", "Tread ray count", 1f, 7f, delegate { return treadRayCount; }, delegate(float v) { treadRayCount = Mathf.RoundToInt(v); }).In("Geometry").Adv().When(whenTreadRayFan));
         s.Add(FactoryFloat("Contact", "cpN", "Maximum contact points", 1f, 6f, delegate { return maxContactPoints; }, delegate(float v) { maxContactPoints = Mathf.RoundToInt(v); }).In("Geometry").Adv());
@@ -324,6 +330,7 @@ public partial class RubberTireWheelScript
                 catch (FormatException) { }
             }
             currentGear = ClampGear(currentGear, GetGearCount());
+            UpdateDriveKeyVisibility();
             factoryLastAppliedConfig = serialized;
         }
         finally
@@ -371,11 +378,8 @@ public partial class RubberTireWheelScript
     internal float FactoryCurrentEngineRpm()
     {
         if (!IsSimulating || !HasRigidbody) return -1f;
-        Vector3 axis = GetDriveAxisWorld();
-        float omega = Vector3.Dot(Rigidbody.angularVelocity, axis);
-        Rigidbody parentBody = GetJointParentBody();
-        if (parentBody != null) omega -= Vector3.Dot(parentBody.angularVelocity, axis);
-        return Mathf.Abs(omega) * GetCurrentTotalDriveRatio() * RpmPerRadPerSecond;
+        if (!drivenWheel) return 0f;
+        return Mathf.Max(0f, currentEngineRpm);
     }
 
     internal void FactoryFrictionEllipse(bool kinetic, out float longitudinal, out float lateral)
@@ -392,6 +396,16 @@ public partial class RubberTireWheelScript
         lateral = factoryTireLatForce / load;
     }
 
+    internal void FactoryTireSlipDiagnostics(
+        out float longitudinalSlip, out float lateralSlip,
+        out float lockBlend, out bool staticSolved)
+    {
+        longitudinalSlip = factoryTireLongSlip;
+        lateralSlip = factoryTireSideSlip;
+        lockBlend = factoryStaticLockBlend;
+        staticSolved = factoryStaticConstraintSolved;
+    }
+
     internal float FactorySupportForce(float penetration)
     {
         return Mathf.Clamp(
@@ -402,8 +416,19 @@ public partial class RubberTireWheelScript
 
     // E6: live telemetry for the workspace strip.
     internal int FactoryCurrentGear() { return currentGear; }
+    internal string FactoryCurrentGearLabel() { return currentGear == 0 ? "R" : currentGear.ToString(CultureInfo.InvariantCulture); }
+    internal bool FactoryIsDrivenWheel() { return drivenWheel; }
     internal float FactoryThrottle01() { return throttle01; }
     internal float FactoryBrake01() { return brake01; }
+
+    internal void FactoryContactQueryDiagnostics(
+        out int rays, out int rawHits, out int acceptedHits, out int saturated)
+    {
+        rays = lastRaycastQueryCount;
+        rawHits = lastRaycastRawHitCount;
+        acceptedHits = lastRaycastAcceptedHitCount;
+        saturated = lastRaycastSaturatedCount;
+    }
 
     internal void FactoryLiveContactSummary(out int contactCount, out float totalLoad)
     {

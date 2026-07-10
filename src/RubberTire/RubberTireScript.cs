@@ -15,6 +15,8 @@ using Modding;
 /// </summary>
 public partial class RubberTireWheelScript : BlockScript
 {
+    internal static readonly List<RubberTireWheelScript> SimulatingInstances =
+        new List<RubberTireWheelScript>(16);
     // =========================
     // 踏面裁切（有限宽度）
     // =========================
@@ -33,6 +35,7 @@ public partial class RubberTireWheelScript : BlockScript
     // A1: radial contact directions around the wheel circle (1 = legacy
     // gravity-down ray only). Walls, ceilings and loop tracks need > 1.
     public int radialRayCount = 8;
+    public bool enableAdaptiveRadialSampling = true;
 
     // ====== Multi-point settings ======
     public int maxContactPoints = 6;          // Top-N colliders by penetration after aggregation
@@ -104,6 +107,13 @@ public partial class RubberTireWheelScript : BlockScript
     private readonly HashSet<Collider> ownMachineColliders = new HashSet<Collider>();
     private int lastOwnMachineHitCount;
     private bool lastGatherWasMultiRay;
+    private int adaptiveRadialCursor = 1;
+    private int lastSuccessfulRadialSector = -1;
+    private readonly int[] radialQuerySectors = new int[16];
+    private int lastRaycastQueryCount;
+    private int lastRaycastRawHitCount;
+    private int lastRaycastAcceptedHitCount;
+    private int lastRaycastSaturatedCount;
 
     // Physics queries must use the Rigidbody pose. With interpolation enabled,
     // reading a child Transform can return a render pose between fixed steps;
@@ -225,6 +235,7 @@ public partial class RubberTireWheelScript : BlockScript
 
     public override void OnSimulateStart()
     {
+        if (!SimulatingInstances.Contains(this)) SimulatingInstances.Add(this);
         contacts.Clear();
         fixedStepCounter = 0;
         currentGear = 1;
@@ -232,6 +243,12 @@ public partial class RubberTireWheelScript : BlockScript
         brake01 = 0f;
         engineLimiterCut = false;
         currentEngineRpm = 0f;
+        adaptiveRadialCursor = 1;
+        lastSuccessfulRadialSector = -1;
+        lastRaycastQueryCount = 0;
+        lastRaycastRawHitCount = 0;
+        lastRaycastAcceptedHitCount = 0;
+        lastRaycastSaturatedCount = 0;
         lastStepHadRaycastContact = false;
         jointParentCached = false;
         jointParentBody = null;
@@ -257,6 +274,7 @@ public partial class RubberTireWheelScript : BlockScript
 
     public override void OnSimulateStop()
     {
+        SimulatingInstances.Remove(this);
         contacts.Clear();
         pointStates.Clear();
         colStates.Clear();
@@ -311,7 +329,7 @@ public partial class RubberTireWheelScript : BlockScript
 
         // Constant test torque hook. Applied before contact processing so the
         // static-friction feed-forward (B1) sees it in the same step.
-        if (Mathf.Abs(driveTorque) > 1e-6f)
+        if (drivenWheel && Mathf.Abs(driveTorque) > 1e-6f)
         {
             float hookFlipSign = Flipped ? -1f : 1f;
             Vector3 hookAxis = GetDriveAxisWorld();
@@ -681,6 +699,10 @@ public partial class RubberTireWheelScript : BlockScript
         outTop.Clear();
         RecycleHitLists();
         lastOwnMachineHitCount = 0;
+        lastRaycastQueryCount = 0;
+        lastRaycastRawHitCount = 0;
+        lastRaycastAcceptedHitCount = 0;
+        lastRaycastSaturatedCount = 0;
 
         if (!useRaycastContact) return;
 
@@ -717,17 +739,55 @@ public partial class RubberTireWheelScript : BlockScript
             else velDir = Vector3.zero;
         }
         bool hasVelDir = velDir.sqrMagnitude > 0.5f;
-        int totalDirs = dirCount + (hasVelDir ? 1 : 0);
-        lastGatherWasMultiRay = totalDirs > 1 || fanCount > 1;
+
+        int sectorQueryCount = 0;
+        if (!enableAdaptiveRadialSampling)
+        {
+            for (int sector = 0; sector < dirCount; sector++)
+                AddRadialQuerySector(sector, radialQuerySectors, ref sectorQueryCount);
+        }
+        else
+        {
+            // Ground/gravity direction is always sampled. Keep the last useful
+            // non-ground sector (wall, ceiling or loop) hot, then rotate a tiny
+            // exploration budget through the remaining resolution sectors.
+            AddRadialQuerySector(0, radialQuerySectors, ref sectorQueryCount);
+            if (lastSuccessfulRadialSector > 0 && lastSuccessfulRadialSector < dirCount)
+                AddRadialQuerySector(lastSuccessfulRadialSector, radialQuerySectors, ref sectorQueryCount);
+
+            if (dirCount > 1)
+            {
+                int probesWanted = lastStepHadRaycastContact ? 1 : 2;
+                int probesAdded = 0;
+                int attempts = 0;
+                while (probesAdded < probesWanted && attempts < dirCount * 2)
+                {
+                    if (adaptiveRadialCursor <= 0 || adaptiveRadialCursor >= dirCount)
+                        adaptiveRadialCursor = 1;
+                    int candidate = adaptiveRadialCursor++;
+                    int before = sectorQueryCount;
+                    AddRadialQuerySector(candidate, radialQuerySectors, ref sectorQueryCount);
+                    if (sectorQueryCount > before) probesAdded++;
+                    attempts++;
+                }
+            }
+        }
+
+        int totalDirectionQueries = sectorQueryCount + (hasVelDir ? 1 : 0);
+        lastGatherWasMultiRay = totalDirectionQueries * fanCount > 1;
 
         // A4: the joint parent is part of this machine's axle assembly, never ground.
         Rigidbody parentRb = GetJointParentBody();
 
-        for (int d = 0; d < totalDirs; d++)
+        int bestNonGroundSector = -1;
+        float bestNonGroundPenetration = -1f;
+        for (int d = 0; d < totalDirectionQueries; d++)
         {
-            Vector3 rayDir = d < dirCount
-                ? Quaternion.AngleAxis((360f * d) / dirCount, wheelAxis) * downDir
+            int sector = d < sectorQueryCount ? radialQuerySectors[d] : -1;
+            Vector3 rayDir = sector >= 0
+                ? Quaternion.AngleAxis((360f * sector) / dirCount, wheelAxis) * downDir
                 : velDir;
+            float directionBestPenetration = -1f;
 
             for (int r = 0; r < fanCount; r++)
             {
@@ -744,6 +804,9 @@ public partial class RubberTireWheelScript : BlockScript
                     contactRayMask,
                     QueryTriggerInteraction.Ignore
                 );
+                lastRaycastQueryCount++;
+                lastRaycastRawHitCount += Mathf.Max(0, hitCount);
+                if (hitCount >= raycastHitBuffer.Length) lastRaycastSaturatedCount++;
 
                 if (hitCount <= 0) continue;
                 if (hitCount > raycastHitBuffer.Length) hitCount = raycastHitBuffer.Length;
@@ -794,9 +857,20 @@ public partial class RubberTireWheelScript : BlockScript
                         hitsByCol.Add(id, list);
                     }
                     list.Add(hs);
+                    lastRaycastAcceptedHitCount++;
+                    if (pen > directionBestPenetration) directionBestPenetration = pen;
                 }
             }
+
+            if (sector > 0 && directionBestPenetration > bestNonGroundPenetration)
+            {
+                bestNonGroundPenetration = directionBestPenetration;
+                bestNonGroundSector = sector;
+            }
         }
+
+        if (enableAdaptiveRadialSampling)
+            lastSuccessfulRadialSector = bestNonGroundSector;
 
         if (hitsByCol.Count == 0) return;
 
@@ -863,6 +937,14 @@ public partial class RubberTireWheelScript : BlockScript
         outTop.Sort(ContactSamplePenDescending);
         if (outTop.Count > N)
             outTop.RemoveRange(N, outTop.Count - N);
+    }
+
+    private static void AddRadialQuerySector(int sector, int[] sectors, ref int count)
+    {
+        if (sectors == null || count >= sectors.Length || sector < 0) return;
+        for (int i = 0; i < count; i++)
+            if (sectors[i] == sector) return;
+        sectors[count++] = sector;
     }
 
     // =========================

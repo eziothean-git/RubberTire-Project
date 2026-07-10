@@ -110,6 +110,8 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
     private Text advancedButtonText;
     private Text groupButtonText;
     private Button engineLutToggleButton;
+    private Button engineAddPointButton;
+    private Button engineDeletePointButton;
     private Text engineLutToggleText;
     private GameObject engineLutEditorRoot;
     private InputField engineLutInput;
@@ -187,6 +189,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
                 target.FactoryPullSettings();
                 RebindRows();
                 chart.Target = target;
+                chart.SelectEnginePoint(-1);
                 UpdateChartMode();
                 RefreshBindings();
                 ApplyRowVisibility();
@@ -260,6 +263,8 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         advancedButtonText = null;
         groupButtonText = null;
         engineLutToggleButton = null;
+        engineAddPointButton = null;
+        engineDeletePointButton = null;
         engineLutToggleText = null;
         engineLutEditorRoot = null;
         engineLutInput = null;
@@ -433,6 +438,12 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         {
             SetEngineLutEditorVisible(!engineLutEditorVisible);
         });
+        engineAddPointButton = CreateButton(chartPanel, "+ Point",
+            new Vector2(244f, -8f), new Vector2(58f, 28f));
+        engineAddPointButton.onClick.AddListener(AddEngineLutPoint);
+        engineDeletePointButton = CreateButton(chartPanel, "- Point",
+            new Vector2(306f, -8f), new Vector2(58f, 28f));
+        engineDeletePointButton.onClick.AddListener(RemoveEngineLutPoint);
         CreateEngineLutEditor(chartPanel);
 
         root.SetActive(false);
@@ -461,12 +472,24 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
 
     private RubberTireWheelScript FindSimulatingWheel()
     {
-        RubberTireWheelScript[] wheels = UnityEngine.Object.FindObjectsOfType<RubberTireWheelScript>();
-        for (int i = 0; i < wheels.Length; i++)
+        for (int i = RubberTireWheelScript.SimulatingInstances.Count - 1; i >= 0; i--)
         {
-            if (wheels[i] != null && wheels[i].IsSimulating) return wheels[i];
+            RubberTireWheelScript wheel = RubberTireWheelScript.SimulatingInstances[i];
+            if (wheel == null || !wheel.IsSimulating)
+            {
+                RubberTireWheelScript.SimulatingInstances.RemoveAt(i);
+                continue;
+            }
+            return wheel;
         }
         return null;
+    }
+
+    internal void PinSimulationTarget(RubberTireWheelScript wheel)
+    {
+        if (wheel == null || !wheel.IsSimulating) return;
+        simTarget = wheel;
+        nextTargetScanTime = Time.unscaledTime + 1f;
     }
 
     private void CreateEngineLutEditor(Transform parent)
@@ -504,9 +527,11 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
 
     private void SetEngineLutEditorVisible(bool visible)
     {
-        engineLutEditorVisible = visible && activeTab == "Engine";
+        engineLutEditorVisible = visible && activeTab == "Engine"
+            && target != null && target.FactoryIsDrivenWheel();
         if (engineLutEditorRoot != null) engineLutEditorRoot.SetActive(engineLutEditorVisible);
-        if (chart != null) chart.raycastTarget = activeTab == "Engine" && !engineLutEditorVisible;
+        if (chart != null) chart.raycastTarget = activeTab == "Engine"
+            && target != null && target.FactoryIsDrivenWheel() && !engineLutEditorVisible;
         if (engineLutToggleText != null)
             engineLutToggleText.text = engineLutEditorVisible ? "Curve" : "Edit RPM|Nm";
         if (engineLutEditorVisible && engineLutInput != null && target != null)
@@ -527,9 +552,33 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
             engineLutStatus.text = status;
         }
         if (!valid) return;
+        if (chart != null) chart.SelectEnginePoint(-1);
         OnSettingChanged();
         UpdateChartTexts();
         if (chart != null) chart.SetVerticesDirty();
+    }
+
+    private void AddEngineLutPoint()
+    {
+        if (target == null || chart == null) return;
+        int inserted;
+        if (!target.FactoryAddEngineLutPoint(chart.SelectedEnginePoint, out inserted)) return;
+        chart.SelectEnginePoint(inserted);
+        if (engineLutInput != null) engineLutInput.text = target.FactoryGetEngineTorqueLut();
+        OnSettingChanged();
+        UpdateChartTexts();
+    }
+
+    private void RemoveEngineLutPoint()
+    {
+        if (target == null || chart == null || chart.SelectedEnginePoint < 0) return;
+        int removed = chart.SelectedEnginePoint;
+        if (!target.FactoryRemoveEngineLutPoint(removed)) return;
+        int remaining = target.FactoryEngineLutPointCount();
+        chart.SelectEnginePoint(Mathf.Clamp(removed, 0, remaining - 1));
+        if (engineLutInput != null) engineLutInput.text = target.FactoryGetEngineTorqueLut();
+        OnSettingChanged();
+        UpdateChartTexts();
     }
 
     private void SelectTab(string tab)
@@ -555,14 +604,26 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
     private void UpdateChartMode()
     {
         if (chart == null) return;
+        bool drivenEngine = activeTab == "Engine"
+            && target != null && target.FactoryIsDrivenWheel();
         if (engineLutToggleButton != null)
-            engineLutToggleButton.gameObject.SetActive(activeTab == "Engine");
-        if (activeTab != "Engine") SetEngineLutEditorVisible(false);
-        if (activeTab == "Engine")
+            engineLutToggleButton.gameObject.SetActive(drivenEngine);
+        if (engineAddPointButton != null)
+            engineAddPointButton.gameObject.SetActive(drivenEngine);
+        if (engineDeletePointButton != null)
+            engineDeletePointButton.gameObject.SetActive(drivenEngine);
+        if (!drivenEngine) SetEngineLutEditorVisible(false);
+        if (drivenEngine)
         {
             chart.Kind = RubberTireChartKind.Engine;
             chartTitle.text = "ENGINE TORQUE / POWER";
             chartLegend.text = "CYAN RPM|Nm LUT (drag white points)    ORANGE power    WHITE live RPM";
+        }
+        else if (activeTab == "Engine")
+        {
+            chart.Kind = RubberTireChartKind.None;
+            chartTitle.text = "NON-DRIVEN WHEEL / BRAKE";
+            chartLegend.text = "Propulsion, engine braking and shift controls are disabled; service braking remains active.";
         }
         else if (activeTab == "Tire")
         {
@@ -585,7 +646,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
                 : "These controls affect diagnostics only; physical parameters live in the other pages.";
         }
         if (contactLive != null && activeTab != "Contact") contactLive.text = "";
-        chart.raycastTarget = activeTab == "Engine" && !engineLutEditorVisible;
+        chart.raycastTarget = drivenEngine && !engineLutEditorVisible;
         chart.SetVerticesDirty();
     }
 
@@ -798,6 +859,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         // Commit is batched onto the 0.2 s tick (and flushed on target switch)
         // so slider drags do not serialize the whole record per event.
         commitPending = true;
+        UpdateChartMode();
         if (chart != null) chart.SetVerticesDirty();
     }
 
@@ -933,6 +995,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         if (rows.Count == 0) return;
 
         for (int i = 0; i < headers.Count; i++) headers[i].AnyVisible = false;
+        bool anyRowPassesFocus = false;
 
         for (int i = 0; i < rows.Count; i++)
         {
@@ -945,6 +1008,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
                 && (setting.VisibleWhen == null || setting.VisibleWhen());
             if (pass)
             {
+                anyRowPassesFocus = true;
                 RubberTireGroupHeader groupHeader;
                 if (headersByKey.TryGetValue(row.GroupKey, out groupHeader))
                     groupHeader.AnyVisible = true;
@@ -952,6 +1016,14 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
             bool shown = pass && !collapsedGroups.Contains(row.GroupKey);
             if (row.Root != null && row.Root.activeSelf != shown)
                 row.Root.SetActive(shown);
+        }
+
+        if (!String.IsNullOrEmpty(focusedGroupKey) && !anyRowPassesFocus)
+        {
+            focusedGroupKey = null;
+            UpdateGroupButton();
+            ApplyRowVisibility();
+            return;
         }
 
         for (int i = 0; i < headers.Count; i++)
@@ -1034,7 +1106,7 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
 
         if (chart.Kind == RubberTireChartKind.Engine)
         {
-            chartLive.text = "GEAR " + target.FactoryCurrentGear()
+            chartLive.text = "GEAR " + target.FactoryCurrentGearLabel()
                 + "   THR " + Mathf.RoundToInt(target.FactoryThrottle01() * 100f) + "%"
                 + "   BRK " + Mathf.RoundToInt(target.FactoryBrake01() * 100f) + "%"
                 + "   RPM " + Mathf.Max(0f, target.FactoryCurrentEngineRpm()).ToString("0")
@@ -1047,11 +1119,18 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         {
             float longitudinal, lateral;
             target.FactoryCurrentFrictionPoint(out longitudinal, out lateral);
+            float longSlip, sideSlip, lockBlend;
+            bool staticSolved;
+            target.FactoryTireSlipDiagnostics(
+                out longSlip, out sideSlip, out lockBlend, out staticSolved);
             int contactCount;
             float totalLoad;
             target.FactoryLiveContactSummary(out contactCount, out totalLoad);
             chartLive.text = "Fx/Fn " + longitudinal.ToString("0.00")
                 + "   Fy/Fn " + lateral.ToString("0.00")
+                + "   slip " + longSlip.ToString("0.00") + "/" + sideSlip.ToString("0.00")
+                + "   lock " + Mathf.RoundToInt(lockBlend * 100f) + "%"
+                + (staticSolved ? " STICK" : "")
                 + "   load " + totalLoad.ToString("0") + " N";
         }
         else
@@ -1065,8 +1144,13 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
         if (contactLive != null && activeTab == "Contact")
         {
             int count = target.FactoryContactSampleCount();
+            int rays, rawHits, acceptedHits, saturated;
+            target.FactoryContactQueryDiagnostics(out rays, out rawHits, out acceptedHits, out saturated);
             string text = "live samples: " + count
-                + "   self hits filtered: " + target.FactoryFilteredOwnMachineHits();
+                + "   self hits filtered: " + target.FactoryFilteredOwnMachineHits()
+                + "\nrays " + rays + "   raw hits " + rawHits
+                + "   accepted " + acceptedHits
+                + (saturated > 0 ? "   SATURATED x" + saturated : "");
             for (int i = 0; i < count; i++)
             {
                 float pen, gate;
@@ -1397,6 +1481,8 @@ public sealed class RubberTireCurveGraphic : MaskableGraphic,
     public RubberTireWheelScript Target;
     public RubberTireChartKind Kind;
     public Action OnEngineCurveEdited;
+    private int selectedEnginePoint = -1;
+    public int SelectedEnginePoint { get { return selectedEnginePoint; } }
 
     private int draggedPoint = -1;
     private float engineEditorMaxRpm = 1f;
@@ -1407,6 +1493,13 @@ public sealed class RubberTireCurveGraphic : MaskableGraphic,
     private static readonly Color Cyan = new Color(0.20f, 0.84f, 0.94f, 1f);
     private static readonly Color Orange = new Color(1f, 0.58f, 0.18f, 1f);
     private static readonly Color White = new Color(0.94f, 0.96f, 0.98f, 0.9f);
+    private static readonly Color Selected = new Color(1f, 0.86f, 0.20f, 1f);
+
+    public void SelectEnginePoint(int index)
+    {
+        selectedEnginePoint = index;
+        SetVerticesDirty();
+    }
 
     protected override void OnPopulateMesh(VertexHelper vh)
     {
@@ -1499,8 +1592,10 @@ public sealed class RubberTireCurveGraphic : MaskableGraphic,
             Vector2 point = Plot(r,
                 Mathf.Clamp01(pointRpm / maxRpm),
                 Mathf.Clamp01(pointTorque / engineEditorTorqueScale));
-            AddLine(vh, point + new Vector2(-4f, 0f), point + new Vector2(4f, 0f), 2f, White);
-            AddLine(vh, point + new Vector2(0f, -4f), point + new Vector2(0f, 4f), 2f, White);
+            float marker = i == selectedEnginePoint ? 7f : 4f;
+            Color markerColor = i == selectedEnginePoint ? Selected : White;
+            AddLine(vh, point + new Vector2(-marker, 0f), point + new Vector2(marker, 0f), 2f, markerColor);
+            AddLine(vh, point + new Vector2(0f, -marker), point + new Vector2(0f, marker), 2f, markerColor);
         }
 
         float liveRpm = Target.FactoryCurrentEngineRpm();
@@ -1536,6 +1631,8 @@ public sealed class RubberTireCurveGraphic : MaskableGraphic,
             bestDistance = distance;
         }
         draggedPoint = best;
+        selectedEnginePoint = best;
+        SetVerticesDirty();
         if (draggedPoint >= 0) eventData.Use();
     }
 

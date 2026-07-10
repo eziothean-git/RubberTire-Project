@@ -52,6 +52,7 @@
     <Compile Include="RubberTireWheelScript.FactorySettings.cs" />
     <Compile Include="RubberTireConfigMapper.cs" />
     <Compile Include="RubberTireFactoryUI.cs" />
+    <Compile Include="RubberTireEngineDashboard.cs" />
     <Compile Include="RubberTireWheelScript.Lateral.cs" />
     <Compile Include="RubberTireWheelScript.Support.cs" />
     <Compile Include="RubberTireScript.cs" />
