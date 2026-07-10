@@ -1126,9 +1126,9 @@ public sealed class RubberTireFactoryUIController : MonoBehaviour
             int contactCount;
             float totalLoad;
             target.FactoryLiveContactSummary(out contactCount, out totalLoad);
-            chartLive.text = "Fx/Fn " + longitudinal.ToString("0.00")
-                + "   Fy/Fn " + lateral.ToString("0.00")
-                + "   slip " + longSlip.ToString("0.00") + "/" + sideSlip.ToString("0.00")
+            chartLive.text = "LONG Fx/Fn " + longitudinal.ToString("0.00")
+                + "   LAT Fy/Fn " + lateral.ToString("0.00")
+                + "   slip L/S " + longSlip.ToString("0.00") + "/" + sideSlip.ToString("0.00")
                 + "   lock " + Mathf.RoundToInt(lockBlend * 100f) + "%"
                 + (staticSolved ? " STICK" : "")
                 + "   load " + totalLoad.ToString("0") + " N";

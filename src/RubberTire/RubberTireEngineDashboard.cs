@@ -20,6 +20,8 @@ internal sealed class RubberTireEngineDashboardRow
 public sealed class RubberTireEngineDashboard : MonoBehaviour
 {
     private GameObject root;
+    private GameObject compactRoot;
+    private Text compactText;
     private RectTransform content;
     private bool open;
     private bool readyRequested;
@@ -48,6 +50,8 @@ public sealed class RubberTireEngineDashboard : MonoBehaviour
                 rows.Clear();
                 wheels.Clear();
                 content = null;
+                compactRoot = null;
+                compactText = null;
             }
             TryBuildUI();
         }
@@ -60,21 +64,19 @@ public sealed class RubberTireEngineDashboard : MonoBehaviour
         }
         if (root == null) return;
 
-        if (!open)
-        {
-            if (root.activeSelf) root.SetActive(false);
-            return;
-        }
-
         if (Time.unscaledTime >= nextScanTime)
         {
             nextScanTime = Time.unscaledTime + 1.5f;
             ScanWheels();
         }
 
-        bool visible = wheels.Count > 0;
-        if (root.activeSelf != visible) root.SetActive(visible);
-        if (!visible || Time.unscaledTime < nextTelemetryTime) return;
+        bool hasWheels = wheels.Count > 0;
+        bool fullVisible = open && hasWheels;
+        bool compactVisible = !open && hasWheels;
+        if (root.activeSelf != fullVisible) root.SetActive(fullVisible);
+        if (compactRoot != null && compactRoot.activeSelf != compactVisible)
+            compactRoot.SetActive(compactVisible);
+        if (!hasWheels || Time.unscaledTime < nextTelemetryTime) return;
         nextTelemetryTime = Time.unscaledTime + 0.10f;
         RefreshTelemetry();
     }
@@ -150,7 +152,35 @@ public sealed class RubberTireEngineDashboard : MonoBehaviour
         scroll.vertical = true;
         scroll.movementType = ScrollRect.MovementType.Clamped;
         scroll.scrollSensitivity = 32f;
+
+        compactRoot = Make.Prefab("UIFactory3", "Panel", Make.ScreenCanvas.transform);
+        compactRoot.name = "Rubber Tire Compact Drive Monitor";
+        RectTransform compactRect = compactRoot.GetComponent<RectTransform>();
+        compactRect.anchorMin = new Vector2(0f, 1f);
+        compactRect.anchorMax = new Vector2(0f, 1f);
+        compactRect.pivot = new Vector2(0f, 1f);
+        compactRect.anchoredPosition = new Vector2(18f, -108f);
+        compactRect.sizeDelta = new Vector2(330f, 56f);
+        Image compactImage = compactRoot.GetComponent<Image>();
+        if (compactImage != null)
+        {
+            compactImage.color = new Color(0.035f, 0.045f, 0.055f, 0.90f);
+            compactImage.raycastTarget = false;
+        }
+        Canvas compactCanvas = compactRoot.GetComponent<Canvas>();
+        if (compactCanvas == null) compactCanvas = compactRoot.AddComponent<Canvas>();
+        compactCanvas.overrideSorting = true;
+        compactCanvas.sortingOrder = 29980;
+        CanvasGroup compactGroup = compactRoot.GetComponent<CanvasGroup>();
+        if (compactGroup == null) compactGroup = compactRoot.AddComponent<CanvasGroup>();
+        compactGroup.interactable = false;
+        compactGroup.blocksRaycasts = false;
+        CreateText(compactRoot.transform, "DRIVE  |  F10 EXPAND", 12, FontStyle.Bold,
+            new Vector2(10f, -4f), new Vector2(310f, 20f), TextAnchor.MiddleLeft, Accent);
+        compactText = CreateText(compactRoot.transform, "", 13, FontStyle.Bold,
+            new Vector2(10f, -25f), new Vector2(310f, 24f), TextAnchor.UpperLeft, Color.white);
         root.SetActive(false);
+        compactRoot.SetActive(false);
     }
 
     private void ScanWheels()
@@ -229,6 +259,7 @@ public sealed class RubberTireEngineDashboard : MonoBehaviour
 
     private void RefreshTelemetry()
     {
+        string compact = "";
         for (int i = 0; i < rows.Count; i++)
         {
             RubberTireEngineDashboardRow row = rows[i];
@@ -251,6 +282,29 @@ public sealed class RubberTireEngineDashboard : MonoBehaviour
             row.BrakeOnly.gameObject.SetActive(!driven);
             row.Chart.Kind = driven ? RubberTireChartKind.Engine : RubberTireChartKind.None;
             row.Chart.SetVerticesDirty();
+
+            if (compact.Length > 0) compact += "\n";
+            compact += "W" + (i + 1).ToString("00") + "   ";
+            if (driven)
+            {
+                compact += "[" + wheel.FactoryCurrentGearLabel() + "]   "
+                    + Mathf.Max(0f, wheel.FactoryCurrentEngineRpm()).ToString("0").PadLeft(5)
+                    + " RPM";
+                if (wheel.FactoryLimiterCut()) compact += "  LIMIT";
+            }
+            else
+            {
+                compact += "[FREE]   BRK "
+                    + Mathf.RoundToInt(wheel.FactoryBrake01() * 100f) + "%";
+            }
+        }
+        if (compactText != null)
+        {
+            compactText.text = compact;
+            float height = Mathf.Clamp(32f + rows.Count * 20f, 52f, 320f);
+            RectTransform compactRect = compactRoot.GetComponent<RectTransform>();
+            compactRect.sizeDelta = new Vector2(330f, height);
+            compactText.rectTransform.sizeDelta = new Vector2(310f, height - 28f);
         }
     }
 
@@ -295,5 +349,6 @@ public sealed class RubberTireEngineDashboard : MonoBehaviour
     private void OnDestroy()
     {
         if (root != null) Destroy(root);
+        if (compactRoot != null) Destroy(compactRoot);
     }
 }

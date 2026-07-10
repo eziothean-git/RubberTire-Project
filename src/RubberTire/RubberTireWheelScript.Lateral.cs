@@ -500,12 +500,32 @@ public partial class RubberTireWheelScript
         factoryStaticLockBlend = lockBlend;
         factoryStaticConstraintSolved = false;
 
-        if (!enableModernLowSpeedTire || lockBlend <= 1e-4f)
+        if (!enableModernLowSpeedTire)
         {
             ResetStaticConstraintHistory(state);
             if (dynamicForce.sqrMagnitude > 1e-10f)
                 ApplyTireForce(dynamicForce, wheelPoint, groundPoint, groundBody, wheelAxis);
             return dynamicForce;
+        }
+
+        if (lockBlend <= 1e-4f)
+        {
+            ResetStaticConstraintHistory(state);
+            // This is unambiguously sliding contact. A relaxation brush can
+            // under-shoot badly when wheel spin rises faster than rolled
+            // distance (creep fades before the brush has built), creating the
+            // observed ~10 km/h traction hole. Sliding friction must already
+            // be on the kinetic ellipse, independent of that history.
+            Vector3 slidingForce = BuildKineticTireForce(
+                slipVelocity, forward, side, normalLoad);
+            if (slidingForce.sqrMagnitude > 1e-10f)
+                ApplyTireForce(slidingForce, wheelPoint, groundPoint, groundBody, wheelAxis);
+            if (enableTireRelaxation)
+            {
+                state.FtireFiltered = slidingForce;
+                if (shearK > 1e-6f) state.shearDispWorld = -slidingForce / shearK;
+            }
+            return slidingForce;
         }
 
         // B1: feed the self-applied propulsion torque of THIS step forward so
@@ -553,18 +573,8 @@ public partial class RubberTireWheelScript
             Vector3 fallbackForce = dynamicForce;
             if (predictedSlip.sqrMagnitude > 1e-10f)
             {
-                if (enableCombinedSlipFriction && side.sqrMagnitude > 1e-6f)
-                {
-                    fallbackForce = BuildCombinedKineticFriction(
-                        predictedSlip, forward, side,
-                        MuKineticEff() * Mathf.Max(0f, longitudinalGripScale) * normalLoad,
-                        MuKineticEff() * Mathf.Max(0f, lateralGripScale) * normalLoad);
-                }
-                else
-                {
-                    fallbackForce = -predictedSlip.normalized
-                        * (MuKineticEff() * normalLoad);
-                }
+                fallbackForce = BuildKineticTireForce(
+                    predictedSlip, forward, side, normalLoad);
             }
             if (fallbackForce.sqrMagnitude > 1e-10f)
                 ApplyTireForce(fallbackForce, wheelPoint, groundPoint, groundBody, wheelAxis);
@@ -914,14 +924,39 @@ public partial class RubberTireWheelScript
 
     private Vector3 BuildCombinedKineticFriction(Vector3 vSlip, Vector3 forward, Vector3 side, float maxLong, float maxSide)
     {
-        Vector3 demand = Vector3.zero;
         float vx = Vector3.Dot(vSlip, forward);
-        if (Mathf.Abs(vx) > 1e-5f && maxLong > 0f)
-            demand += -Mathf.Sign(vx) * maxLong * forward;
         float vy = Vector3.Dot(vSlip, side);
-        if (Mathf.Abs(vy) > 1e-5f && maxSide > 0f)
-            demand += -Mathf.Sign(vy) * maxSide * side;
-        return ClampCombinedTireForce(demand, forward, side, maxLong, maxSide);
+        float weightedLong = Mathf.Max(0f, maxLong) * vx;
+        float weightedSide = Mathf.Max(0f, maxSide) * vy;
+        float denominator = Mathf.Sqrt(
+            weightedLong * weightedLong + weightedSide * weightedSide);
+        if (denominator <= 1e-8f) return Vector3.zero;
+
+        // Maximum-dissipation direction on an anisotropic friction ellipse:
+        // F = -(a^2*vx, b^2*vy) / sqrt((a*vx)^2 + (b*vy)^2).
+        // Unlike per-axis Sign(), tiny lateral numerical noise cannot request
+        // full lateral grip and steal the longitudinal force budget.
+        float fx = -Mathf.Max(0f, maxLong) * weightedLong / denominator;
+        float fy = -Mathf.Max(0f, maxSide) * weightedSide / denominator;
+        return forward * fx + side * fy;
+    }
+
+    private Vector3 BuildKineticTireForce(
+        Vector3 slipVelocity,
+        Vector3 forward,
+        Vector3 side,
+        float normalLoad)
+    {
+        if (slipVelocity.sqrMagnitude <= 1e-10f || normalLoad <= 1e-6f)
+            return Vector3.zero;
+        if (enableCombinedSlipFriction && side.sqrMagnitude > 1e-6f)
+        {
+            return BuildCombinedKineticFriction(
+                slipVelocity, forward, side,
+                MuKineticEff() * Mathf.Max(0f, longitudinalGripScale) * normalLoad,
+                MuKineticEff() * Mathf.Max(0f, lateralGripScale) * normalLoad);
+        }
+        return -slipVelocity.normalized * (MuKineticEff() * normalLoad);
     }
 
     private Vector3 BuildLowSpeedCreepForce(Vector3 vSlip, Vector3 forward, Vector3 side, float normalLoad)
